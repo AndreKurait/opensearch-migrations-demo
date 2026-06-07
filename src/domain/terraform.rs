@@ -91,9 +91,19 @@ pub fn source_instance_tf(engine: SourceEngine, version: &str) -> String {
                 .to_string(),
         ),
     };
+    // PRIVATE BY DESIGN. A public EC2 is impossible here: a dedicated VPC with a
+    // PRIVATE subnet (map_public_ip_on_launch=false, no IGW route — only a NAT
+    // for outbound image pulls), the instance pinned to that subnet with
+    // associate_public_ip_address=false, and VPC-CIDR-only ingress. (The earlier
+    // version used the *default* subnet, whose map_public_ip_on_launch=true gave
+    // the instance a public IP even with associate_public_ip_address=false.)
+    let header = format!(
+        "# Source {} {version} on a single PRIVATE EC2 instance (Dockerized for\n\
+         # engine/version fidelity — ES/Solr have no managed AWS equivalent).",
+        engine.label()
+    );
     format!(
-        "# Source {engine_label} {version} on a single EC2 instance (Dockerized\n\
-         # for engine/version fidelity — ES/Solr have no managed AWS equivalent).\n\
+        "{header}\n\
          data \"aws_ami\" \"al2023\" {{\n\
          \x20 most_recent = true\n\
          \x20 owners      = [\"amazon\"]\n\
@@ -103,13 +113,64 @@ pub fn source_instance_tf(engine: SourceEngine, version: &str) -> String {
          \x20 }}\n\
          }}\n\
          \n\
+         data \"aws_availability_zones\" \"available\" {{ state = \"available\" }}\n\
+         \n\
+         resource \"aws_vpc\" \"src\" {{\n\
+         \x20 cidr_block           = \"10.30.0.0/16\"\n\
+         \x20 enable_dns_support   = true\n\
+         \x20 enable_dns_hostnames = true\n\
+         \x20 tags                 = {{ Name = \"${{var.prefix}}-src-vpc\" }}\n\
+         }}\n\
+         resource \"aws_internet_gateway\" \"src\" {{ vpc_id = aws_vpc.src.id }}\n\
+         # Public subnet ONLY hosts the NAT gateway; the instance never lives here.\n\
+         resource \"aws_subnet\" \"src_public\" {{\n\
+         \x20 vpc_id            = aws_vpc.src.id\n\
+         \x20 cidr_block        = cidrsubnet(aws_vpc.src.cidr_block, 8, 0)\n\
+         \x20 availability_zone = data.aws_availability_zones.available.names[0]\n\
+         }}\n\
+         resource \"aws_subnet\" \"src_private\" {{\n\
+         \x20 vpc_id                  = aws_vpc.src.id\n\
+         \x20 cidr_block              = cidrsubnet(aws_vpc.src.cidr_block, 8, 1)\n\
+         \x20 availability_zone       = data.aws_availability_zones.available.names[0]\n\
+         \x20 map_public_ip_on_launch = false\n\
+         }}\n\
+         resource \"aws_eip\" \"src_nat\" {{ domain = \"vpc\" }}\n\
+         resource \"aws_nat_gateway\" \"src\" {{\n\
+         \x20 allocation_id = aws_eip.src_nat.id\n\
+         \x20 subnet_id     = aws_subnet.src_public.id\n\
+         }}\n\
+         resource \"aws_route_table\" \"src_public\" {{\n\
+         \x20 vpc_id = aws_vpc.src.id\n\
+         \x20 route {{\n\
+         \x20   cidr_block = \"0.0.0.0/0\"\n\
+         \x20   gateway_id = aws_internet_gateway.src.id\n\
+         \x20 }}\n\
+         }}\n\
+         resource \"aws_route_table_association\" \"src_public\" {{\n\
+         \x20 subnet_id = aws_subnet.src_public.id\n\
+         \x20 route_table_id = aws_route_table.src_public.id\n\
+         }}\n\
+         resource \"aws_route_table\" \"src_private\" {{\n\
+         \x20 vpc_id = aws_vpc.src.id\n\
+         \x20 route {{\n\
+         \x20   cidr_block     = \"0.0.0.0/0\"\n\
+         \x20   nat_gateway_id = aws_nat_gateway.src.id\n\
+         \x20 }}\n\
+         }}\n\
+         resource \"aws_route_table_association\" \"src_private\" {{\n\
+         \x20 subnet_id = aws_subnet.src_private.id\n\
+         \x20 route_table_id = aws_route_table.src_private.id\n\
+         }}\n\
+         \n\
          resource \"aws_security_group\" \"source\" {{\n\
          \x20 name_prefix = \"${{var.prefix}}-source-\"\n\
+         \x20 vpc_id      = aws_vpc.src.id\n\
          \x20 ingress {{\n\
+         \x20   description = \"Search API - reachable only from inside the VPC.\"\n\
          \x20   from_port   = {port}\n\
          \x20   to_port     = {port}\n\
          \x20   protocol    = \"tcp\"\n\
-         \x20   cidr_blocks = [\"10.0.0.0/8\"]\n\
+         \x20   cidr_blocks = [aws_vpc.src.cidr_block]\n\
          \x20 }}\n\
          \x20 egress {{\n\
          \x20   from_port   = 0\n\
@@ -122,6 +183,7 @@ pub fn source_instance_tf(engine: SourceEngine, version: &str) -> String {
          resource \"aws_instance\" \"source\" {{\n\
          \x20 ami                    = data.aws_ami.al2023.id\n\
          \x20 instance_type          = \"t3.large\"\n\
+         \x20 subnet_id              = aws_subnet.src_private.id\n\
          \x20 vpc_security_group_ids = [aws_security_group.source.id]\n\
          \x20 # GUARDRAIL: never assign a public IP (demo policy: no public EC2).\n\
          \x20 associate_public_ip_address = false\n\
@@ -135,10 +197,11 @@ pub fn source_instance_tf(engine: SourceEngine, version: &str) -> String {
          \x20 tags = {{ Name = \"${{var.prefix}}-source\" }}\n\
          }}\n\
          \n\
-         # Fail the plan if a public IP is ever requested on the source instance.\n\
+         # Fail the plan if a public IP is ever requested, OR if the instance's\n\
+         # subnet auto-assigns one (the bug this guards against).\n\
          check \"no_public_ip\" {{\n\
          \x20 assert {{\n\
-         \x20   condition     = aws_instance.source.associate_public_ip_address == false\n\
+         \x20   condition     = aws_instance.source.associate_public_ip_address == false && aws_subnet.src_private.map_public_ip_on_launch == false\n\
          \x20   error_message = \"The source instance must never have a public IP (demo policy: no public EC2).\"\n\
          \x20 }}\n\
          }}\n\
@@ -146,7 +209,6 @@ pub fn source_instance_tf(engine: SourceEngine, version: &str) -> String {
          output \"source_endpoint\" {{\n\
          \x20 value = \"http://${{aws_instance.source.private_ip}}:{port}\"\n\
          }}\n",
-        engine_label = engine.label(),
     )
 }
 
@@ -355,31 +417,31 @@ mod tests {
 
     #[test]
     fn source_instance_forbids_a_public_ip() {
-        // The guardrail: emitted source instances must never get a public IP,
-        // and a check block enforces it at plan time.
+        // The guardrail: emitted source instances must be PRIVATE by design — a
+        // dedicated VPC + private subnet (no public-IP-on-launch), the instance
+        // pinned to it, and a check that asserts BOTH the instance flag and the
+        // subnet flag (the default-subnet bug defeated the instance flag alone).
         for eng in [
             SourceEngine::Elasticsearch,
             SourceEngine::OpenSearch,
             SourceEngine::Solr,
         ] {
             let tf = source_instance_tf(eng, "1.2.3");
+            assert!(tf.contains("associate_public_ip_address = false"));
+            // A dedicated VPC + a private subnet the instance is pinned to.
             assert!(
-                tf.contains("associate_public_ip_address = false"),
-                "{} instance must disable public IP",
+                tf.contains("resource \"aws_vpc\" \"src\""),
+                "{} needs its own VPC",
                 eng.id()
             );
-            assert!(
-                tf.contains("check \"no_public_ip\""),
-                "{} must carry the no-public-ip guard",
-                eng.id()
-            );
-            // No 0.0.0.0/0 INGRESS (egress 0.0.0.0/0 is fine for the image pull).
-            assert!(
-                !tf.contains(
-                    "cidr_blocks = [\"0.0.0.0/0\"]\n         \x20 }}\n         \x20 egress"
-                ),
-                "ingress must not be open to the world"
-            );
+            assert!(tf.contains("aws_subnet\" \"src_private\""));
+            assert!(tf.contains("map_public_ip_on_launch = false"));
+            assert!(tf.contains("subnet_id              = aws_subnet.src_private.id"));
+            assert!(tf.contains("aws_nat_gateway")); // egress for the image pull
+                                                     // The guard checks the subnet flag too, not just the instance flag.
+            assert!(tf.contains("aws_subnet.src_private.map_public_ip_on_launch == false"));
+            // Ingress is VPC-CIDR-only, never 0.0.0.0/0.
+            assert!(tf.contains("cidr_blocks = [aws_vpc.src.cidr_block]"));
         }
     }
 

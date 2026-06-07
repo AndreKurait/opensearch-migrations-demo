@@ -79,8 +79,12 @@ pub struct Snapshot {
     pub target: Vec<Row>,
     /// Migration Assistant rows (console statefulset / collection group).
     pub ma: Vec<Row>,
-    /// Monotonic tick counter (incremented each refresh) — drives the spinner.
+    /// Probe tick — incremented each (slow, ~2s) resource re-probe.
     pub tick: u64,
+    /// Spinner frame — bumped on each (fast, ~120ms) redraw, independent of the
+    /// probe tick, so the loading indicator animates smoothly while resources
+    /// are only re-queried every couple of seconds.
+    pub frame: u64,
 }
 
 impl Snapshot {
@@ -108,11 +112,21 @@ impl Snapshot {
     }
 }
 
-/// Gather a fresh [`Snapshot`] for `answers` through the runner. Each probe is a
-/// cheap read (`kind get clusters`, `kubectl get pods`, an in-cluster `curl`
-/// `_count`); failures degrade to `Down`/`Pending` rather than erroring, so the
-/// dashboard keeps ticking even mid-provision.
+/// Gather a fresh [`Snapshot`] for `answers` through the runner. Dispatches on
+/// the deploy target: a Cloud plan probes real AWS resources (no Docker), a
+/// Local plan probes KIND. Each probe is a cheap read; failures degrade to
+/// `Down`/`Pending` rather than erroring, so the dashboard keeps ticking even
+/// mid-provision.
 pub fn probe<R: CommandRunner>(runner: &R, answers: &Answers, tick: u64) -> Snapshot {
+    if answers.target == Some(crate::model::Target::Cloud) {
+        probe_cloud(runner, answers, tick)
+    } else {
+        probe_local(runner, answers, tick)
+    }
+}
+
+/// Probe the LOCAL (KIND) topology: clusters, source/target pods, indices, MA.
+fn probe_local<R: CommandRunner>(runner: &R, answers: &Answers, tick: u64) -> Snapshot {
     let existing = list_clusters(runner);
     let mut snap = Snapshot {
         tick,
@@ -205,6 +219,77 @@ pub fn probe<R: CommandRunner>(runner: &R, answers: &Answers, tick: u64) -> Snap
             "installed to workspace bin/",
         ));
     }
+
+    snap
+}
+
+/// Probe the CLOUD (AWS / Terraform) topology — there are NO Docker containers
+/// here, so we query the real AWS resources the terraform creates: the EC2
+/// source instance (by Name tag), the S3 snapshot bucket, and the target (an
+/// AOSS NextGen collection or an OpenSearch Service domain). All reads go
+/// through the `aws` CLI and degrade gracefully (Pending when not yet up /
+/// credentials missing). The "clusters" panel is relabeled to the AWS account
+/// context so a cloud run never shows phantom KIND clusters.
+fn probe_cloud<R: CommandRunner>(runner: &R, answers: &Answers, tick: u64) -> Snapshot {
+    let mut snap = Snapshot {
+        tick,
+        ..Default::default()
+    };
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| plan::AOSS_REGION.to_string());
+    let profile = answers.effective_aws_profile().to_string();
+
+    // ---- account context (replaces the KIND-clusters panel) ----
+    if !runner.has_command("aws") {
+        snap.clusters
+            .push(Row::new("AWS", Health::Down, "aws CLI not on PATH"));
+    } else {
+        match aws_caller_arn(runner, &profile, &region) {
+            Some(arn) => {
+                let acct = arn.split(':').nth(4).unwrap_or("?").to_string();
+                snap.clusters.push(Row::new(
+                    "AWS account",
+                    Health::Up,
+                    format!("{acct} · {region} · profile {profile}"),
+                ));
+            }
+            None => snap.clusters.push(Row::new(
+                "AWS account",
+                Health::Down,
+                format!("creds missing/expired (profile {profile})"),
+            )),
+        }
+    }
+
+    // ---- source: the EC2 instance terraform creates (tag Name=ma-demo-source) ----
+    let (sh, sd) = ec2_status(runner, "ma-demo-source", &profile, &region);
+    snap.source_pods.push(Row::new("source EC2", sh, sd));
+
+    // ---- snapshot bucket (S3) ----
+    if answers.snapshot_storage != Some(crate::model::SnapshotStorage::None) {
+        let (bh, bd) = s3_bucket_status(runner, "ma-demo-snapshots", &profile, &region);
+        snap.source_pods.push(Row::new("S3 snapshots", bh, bd));
+    }
+
+    // ---- target ----
+    if answers.provisions_aoss_target() {
+        snap.target.push(aoss_status(runner, answers));
+    } else if answers.target_mode == Some(crate::model::TargetMode::Provision) {
+        let (th, td) = opensearch_domain_status(runner, "ma-demo-target", &profile, &region);
+        snap.target.push(Row::new("OpenSearch Service", th, td));
+    } else {
+        snap.target.push(Row::new(
+            "target",
+            Health::NotApplicable,
+            "left to Migration Assistant",
+        ));
+    }
+
+    // ---- MA: cloud always installs the EKS-targeting CLI ----
+    snap.ma.push(Row::new(
+        "MA CLI",
+        Health::NotApplicable,
+        "installed to workspace bin/ (deploys to EKS)",
+    ));
 
     snap
 }
@@ -360,6 +445,140 @@ fn parse_count(json: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
+// ---- cloud (AWS) probe helpers ----
+
+/// The caller ARN for a profile/region (`aws sts get-caller-identity`), or
+/// `None` when credentials are missing/expired.
+fn aws_caller_arn<R: CommandRunner>(runner: &R, profile: &str, region: &str) -> Option<String> {
+    let out = runner.run(
+        "aws",
+        &[
+            "sts",
+            "get-caller-identity",
+            "--profile",
+            profile,
+            "--region",
+            region,
+            "--query",
+            "Arn",
+            "--output",
+            "text",
+        ],
+    );
+    let arn = out.trimmed_stdout().trim();
+    (out.success() && !arn.is_empty() && arn != "None").then(|| arn.to_string())
+}
+
+/// Status of the EC2 source instance (tagged `Name=<name>`): its instance-state
+/// → health, plus a short detail. Pending when no matching instance exists yet.
+fn ec2_status<R: CommandRunner>(
+    runner: &R,
+    name: &str,
+    profile: &str,
+    region: &str,
+) -> (Health, String) {
+    let out = runner.run(
+        "aws",
+        &[
+            "ec2",
+            "describe-instances",
+            "--profile",
+            profile,
+            "--region",
+            region,
+            "--filters",
+            &format!("Name=tag:Name,Values={name}"),
+            "Name=instance-state-name,Values=pending,running,stopping,stopped",
+            "--query",
+            "Reservations[].Instances[].State.Name",
+            "--output",
+            "text",
+        ],
+    );
+    if !out.success() {
+        return (Health::Pending, "querying".into());
+    }
+    match out.trimmed_stdout().split_whitespace().next() {
+        Some("running") => (Health::Up, "running".into()),
+        Some("pending") => (Health::Pending, "launching".into()),
+        Some(other) => (Health::Pending, other.to_string()),
+        None => (Health::Pending, "not created yet".into()),
+    }
+}
+
+/// Status of the S3 snapshot bucket (prefix match on `<prefix>`). Up when a
+/// bucket with that prefix exists.
+fn s3_bucket_status<R: CommandRunner>(
+    runner: &R,
+    prefix: &str,
+    profile: &str,
+    _region: &str,
+) -> (Health, String) {
+    let out = runner.run(
+        "aws",
+        &[
+            "s3api",
+            "list-buckets",
+            "--profile",
+            profile,
+            "--query",
+            &format!("Buckets[?starts_with(Name, `{prefix}`)].Name | [0]"),
+            "--output",
+            "text",
+        ],
+    );
+    if !out.success() {
+        return (Health::Pending, "querying".into());
+    }
+    let name = out.trimmed_stdout().trim();
+    if name.is_empty() || name == "None" {
+        (Health::Pending, "not created yet".into())
+    } else {
+        (Health::Up, name.to_string())
+    }
+}
+
+/// Status of an Amazon OpenSearch Service domain (by name): Active processing
+/// → health + endpoint.
+fn opensearch_domain_status<R: CommandRunner>(
+    runner: &R,
+    name: &str,
+    profile: &str,
+    region: &str,
+) -> (Health, String) {
+    let out = runner.run(
+        "aws",
+        &[
+            "opensearch",
+            "describe-domain",
+            "--profile",
+            profile,
+            "--region",
+            region,
+            "--domain-name",
+            name,
+            "--query",
+            "DomainStatus.{processing:Processing,endpoint:Endpoint,created:Created}",
+            "--output",
+            "text",
+        ],
+    );
+    if !out.success() {
+        return (Health::Pending, "not created yet".into());
+    }
+    let s = out.trimmed_stdout();
+    // `Created Endpoint Processing` columns; Processing=False means ready.
+    if s.contains("False") {
+        let ep = s
+            .split_whitespace()
+            .find(|t| t.contains('.'))
+            .unwrap_or("active");
+        (Health::Up, ep.to_string())
+    } else {
+        (Health::Pending, "processing".into())
+    }
+}
+
 /// AOSS collection status row (ACTIVE + endpoint, via batch-get-collection).
 fn aoss_status<R: CommandRunner>(runner: &R, answers: &Answers) -> Row {
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| plan::AOSS_REGION.to_string());
@@ -427,21 +646,40 @@ pub fn render(frame: &mut Frame, snap: &Snapshot, answers: &Answers) {
 
     render_header(frame, header, snap, answers);
 
-    // Two columns: left = clusters + source + indices; right = target + MA.
+    let cloud = answers.target == Some(crate::model::Target::Cloud);
+    // Target-aware panel labels: a cloud run has no KIND clusters or in-cluster
+    // index counts — it shows the AWS account + resources instead.
+    let (clusters_title, source_title) = if cloud {
+        (" AWS ", " AWS resources ")
+    } else {
+        (" KIND clusters ", " Source workloads ")
+    };
+
+    // Two columns: left = clusters/AWS + source; right = target + MA. The
+    // seeded-indices panel only applies to the local (in-cluster) path.
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(body);
-    let [clusters_a, source_a, indices_a] = Layout::vertical([
-        Constraint::Length(snap.clusters.len() as u16 + 2),
-        Constraint::Min(4),
-        Constraint::Length(manifests::SEED_INDICES.len() as u16 + 2),
-    ])
-    .areas(left);
+    if cloud {
+        let [clusters_a, source_a] = Layout::vertical([
+            Constraint::Length(snap.clusters.len() as u16 + 2),
+            Constraint::Min(4),
+        ])
+        .areas(left);
+        panel(frame, clusters_a, clusters_title, &snap.clusters);
+        panel(frame, source_a, source_title, &snap.source_pods);
+    } else {
+        let [clusters_a, source_a, indices_a] = Layout::vertical([
+            Constraint::Length(snap.clusters.len() as u16 + 2),
+            Constraint::Min(4),
+            Constraint::Length(manifests::SEED_INDICES.len() as u16 + 2),
+        ])
+        .areas(left);
+        panel(frame, clusters_a, clusters_title, &snap.clusters);
+        panel(frame, source_a, source_title, &snap.source_pods);
+        panel(frame, indices_a, " Seeded indices ", &snap.indices);
+    }
     let [target_a, ma_a] =
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
-
-    panel(frame, clusters_a, " KIND clusters ", &snap.clusters);
-    panel(frame, source_a, " Source workloads ", &snap.source_pods);
-    panel(frame, indices_a, " Seeded indices ", &snap.indices);
     panel(frame, target_a, " Target ", &snap.target);
     panel(frame, ma_a, " Migration Assistant ", &snap.ma);
 
@@ -451,7 +689,9 @@ pub fn render(frame: &mut Frame, snap: &Snapshot, answers: &Answers) {
 
 fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, answers: &Answers) {
     let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let s = spinner[(snap.tick as usize) % spinner.len()];
+    // Driven by the fast frame counter (not the slow probe tick) so it spins
+    // smoothly rather than stepping once per 2s re-probe.
+    let s = spinner[(snap.frame as usize) % spinner.len()];
     let title = Line::from(vec![
         Span::from(format!(" {s} ")).bold().on_blue(),
         Span::from(" Migration Assistant — Demo Environment ").bold(),
@@ -541,19 +781,24 @@ fn run_loop<R: CommandRunner>(
 ) -> std::io::Result<()> {
     use ratatui::crossterm::event::{self, Event};
     let mut counter: u64 = 0;
+    let mut frame: u64 = 0;
     let mut snap = probe(runner, answers, counter);
     let mut last = std::time::Instant::now();
+    // Fast redraw cadence drives the spinner; resources re-probe every `tick`.
+    let spin = std::time::Duration::from_millis(120);
     loop {
+        snap.frame = frame;
         terminal.draw(|f| render(f, &snap, answers))?;
-        // Poll input on a short interval so quitting is snappy even between
-        // (slower) resource re-probes.
-        if event::poll(std::time::Duration::from_millis(150))? {
+        // Poll input on the spinner interval so the animation stays smooth AND
+        // quitting is snappy, independent of the (slower) resource re-probe.
+        if event::poll(spin)? {
             if let Event::Key(key) = event::read()? {
                 if key.is_press() && key_quits(key.code) {
                     return Ok(());
                 }
             }
         }
+        frame = frame.wrapping_add(1);
         if last.elapsed() >= tick {
             counter = counter.wrapping_add(1);
             snap = probe(runner, answers, counter);
@@ -578,6 +823,126 @@ mod tests {
         a.target_kind = Some(crate::model::TargetKind::KindOpenSearch);
         a.target_version = Some("3.3.0".into());
         a
+    }
+
+    fn cloud_answers() -> Answers {
+        let mut a = Answers::new();
+        a.target = Some(Target::Cloud);
+        a.source_engine = Some(SourceEngine::Solr);
+        a.source_version = Some("8.11.3".into());
+        a.snapshot_storage = Some(crate::model::SnapshotStorage::AwsS3);
+        a.target_mode = Some(TargetMode::Provision);
+        a.target_kind = Some(crate::model::TargetKind::AossServerlessNextGen);
+        a.aws_profile = Some("default".into());
+        a.aws_region = Some("us-east-1".into());
+        a
+    }
+
+    #[test]
+    fn cloud_probe_shows_aws_resources_not_kind() {
+        let r = MockRunner::new()
+            .with_command("aws")
+            .stub(
+                "aws",
+                &["sts", "get-caller-identity"],
+                0,
+                "arn:aws:sts::874041194807:assumed-role/Role/sess",
+            )
+            .stub("aws", &["ec2", "describe-instances"], 0, "running")
+            .stub("aws", &["s3api", "list-buckets"], 0, "ma-demo-snapshots-abc123")
+            .stub(
+                "aws",
+                &["batch-get-collection"],
+                0,
+                r#"{"collectionDetails":[{"status":"ACTIVE","collectionEndpoint":"https://x.aoss.us-east-1.on.aws","id":"x"}]}"#,
+            );
+        let snap = probe(&r, &cloud_answers(), 0);
+        // NO `kind get clusters` on the cloud path.
+        assert!(!r.any_call_contains("kind get clusters"));
+        // AWS account context shown (account id parsed from the ARN).
+        assert!(snap.clusters.iter().any(|c| c.label == "AWS account"
+            && c.health == Health::Up
+            && c.detail.contains("874041194807")));
+        // Real AWS resources, not phantom KIND pods.
+        assert!(snap
+            .source_pods
+            .iter()
+            .any(|r| r.label == "source EC2" && r.health == Health::Up));
+        assert!(snap
+            .source_pods
+            .iter()
+            .any(|r| r.label == "S3 snapshots" && r.health == Health::Up));
+        assert!(snap
+            .target
+            .iter()
+            .any(|t| t.label == "AOSS NextGen" && t.health == Health::Up));
+        // The misleading "cluster not up yet" placeholder must NOT appear.
+        assert!(!snap
+            .source_pods
+            .iter()
+            .any(|r| r.detail.contains("cluster not up yet")));
+    }
+
+    #[test]
+    fn cloud_probe_degrades_when_creds_missing() {
+        // aws present but sts fails (expired creds) → account row Down, no panic.
+        let r =
+            MockRunner::new()
+                .with_command("aws")
+                .stub_stderr("aws", &["sts"], 255, "ExpiredToken");
+        let snap = probe(&r, &cloud_answers(), 0);
+        assert!(snap
+            .clusters
+            .iter()
+            .any(|c| c.label == "AWS account" && c.health == Health::Down));
+    }
+
+    #[test]
+    fn cloud_render_labels_panels_for_aws() {
+        let r = MockRunner::new().with_command("aws");
+        let snap = probe(&r, &cloud_answers(), 0);
+        let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        t.draw(|f| render(f, &snap, &cloud_answers())).unwrap();
+        let buf = t.backend().buffer().clone();
+        let text: String = (0..buf.area().height)
+            .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(
+            text.contains("AWS resources"),
+            "cloud run should label the panel 'AWS resources'"
+        );
+        assert!(
+            !text.contains("KIND clusters"),
+            "cloud run must not show a KIND panel"
+        );
+        assert!(
+            !text.contains("Seeded indices"),
+            "no in-cluster index panel on cloud"
+        );
+    }
+
+    #[test]
+    fn spinner_frame_is_independent_of_probe_tick() {
+        // The header spinner is driven by `frame`, not `tick`, so it animates on
+        // fast redraws while the probe tick only steps every ~2s.
+        let r = MockRunner::new();
+        let mut snap = probe(&r, &local_answers(), 0);
+        // The header is inside a bordered block, so the spinner sits on the
+        // inner row (y=1), not the border row (y=0).
+        let glyph_at = |s: &Snapshot| {
+            let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            t.draw(|f| render(f, s, &local_answers())).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..buf.area().width)
+                .map(|x| buf[(x, 1)].symbol().to_string())
+                .collect::<String>()
+        };
+        snap.frame = 0;
+        let g0 = glyph_at(&snap);
+        snap.frame = 3; // advance spinner WITHOUT re-probing (tick unchanged)
+        let g3 = glyph_at(&snap);
+        assert_ne!(g0, g3, "spinner glyph must change as frame advances");
     }
 
     #[test]
