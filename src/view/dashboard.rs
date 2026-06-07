@@ -644,7 +644,7 @@ mod tests {
                 "kubectl",
                 &["kind-ma-demo-source", "get", "pods"],
                 0,
-                "source-opensearch-0   1/1   Running   0   2m\nlocust-abc-xyz   1/1   Running   0   2m",
+                "source-opensearch-0   1/1   Running   0   2m\nlocust-6c86b77b45-td7fx   1/1   Running   0   2m",
             )
             .stub(
                 "kubectl",
