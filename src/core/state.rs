@@ -4,7 +4,7 @@
 //! Mirrors the migration-assistant CLI's per-stage state directory: the harness
 //! writes everything under `./migration-demo-workspace/` (one removable folder).
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::Answers;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -123,7 +123,16 @@ impl State {
         if text.trim().is_empty() {
             return Ok(());
         }
-        self.plan = serde_json::from_str(&text)?;
+        // A corrupt plan.json gets an actionable message naming the file + the
+        // fix, rather than the bare serde "expected value at line N" (which the
+        // blanket From<serde_json::Error> would produce).
+        self.plan = serde_json::from_str(&text).map_err(|e| {
+            Error::die(format!(
+                "could not parse the saved plan at {} ({e}). Reset it with `ma-demo clear` \
+                 (this only wipes the local workspace, not any provisioned resources).",
+                path.display()
+            ))
+        })?;
         Ok(())
     }
 
@@ -180,6 +189,23 @@ mod tests {
         let mut s = State::new(tmp.path().join("nope"));
         assert!(s.load().is_ok());
         assert_eq!(s.plan.step, Step::Planned);
+    }
+
+    #[test]
+    fn load_corrupt_plan_gives_actionable_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("plan.json"), "{ not valid json ").unwrap();
+        let mut s = State::new(dir);
+        let err = s.load().unwrap_err();
+        // Names the file and the fix instead of a bare serde line/column message.
+        assert!(err.message.contains("plan.json"), "got: {}", err.message);
+        assert!(
+            err.message.contains("ma-demo clear"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]

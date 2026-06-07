@@ -93,10 +93,24 @@ pub struct Flags {
     pub aws_region: Option<String>,
 }
 
-/// Parse flags out of the argument list (order-independent).
-pub fn parse_flags(args: &[String]) -> Flags {
+/// Parse flags out of the argument list (order-independent). A value-taking flag
+/// (`--workspace`, `--ma-handoff`, `--aws-profile`, `--aws-region`) whose next
+/// token is missing or itself looks like a flag is a usage error (exit 64) —
+/// otherwise `--workspace --dry-run` would silently consume `--dry-run` as the
+/// workspace path.
+pub fn parse_flags(args: &[String]) -> Result<Flags> {
     let mut f = Flags::default();
     let mut i = 0;
+    // Read the value for a value-taking flag, erroring if it's missing or is a flag.
+    let take_value = |args: &[String], i: usize, name: &str| -> Result<String> {
+        match args.get(i + 1) {
+            Some(v) if !v.starts_with('-') => Ok(v.clone()),
+            _ => Err(Error::with_code(
+                format!("{name} requires a value (e.g. `{name} <value>`)"),
+                64,
+            )),
+        }
+    };
     while i < args.len() {
         match args[i].as_str() {
             "-y" | "--non-interactive" | "--yes" => f.non_interactive = true,
@@ -105,19 +119,19 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "--no-apply" => f.no_apply = true,
             "--apply" | "--auto-approve" => f.apply = true,
             "--workspace" => {
-                f.workspace = args.get(i + 1).cloned();
+                f.workspace = Some(take_value(args, i, "--workspace")?);
                 i += 1;
             }
             "--ma-handoff" => {
-                f.ma_handoff = args.get(i + 1).cloned();
+                f.ma_handoff = Some(take_value(args, i, "--ma-handoff")?);
                 i += 1;
             }
             "--aws-profile" => {
-                f.aws_profile = args.get(i + 1).cloned();
+                f.aws_profile = Some(take_value(args, i, "--aws-profile")?);
                 i += 1;
             }
             "--aws-region" => {
-                f.aws_region = args.get(i + 1).cloned();
+                f.aws_region = Some(take_value(args, i, "--aws-region")?);
                 i += 1;
             }
             s => {
@@ -134,7 +148,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         }
         i += 1;
     }
-    f
+    Ok(f)
 }
 
 /// Run the fail-silent startup update check and return an upgrade hint if a
@@ -253,7 +267,7 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
     args: &[String],
     force_dry: bool,
 ) -> Result<()> {
-    let mut flags = parse_flags(args);
+    let mut flags = parse_flags(args)?;
     flags.dry_run = flags.dry_run || force_dry;
     let workspace = flags
         .workspace
@@ -429,7 +443,7 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
 /// real resources every 2s, stays up until q/Esc). Reads the saved plan to know
 /// what to probe.
 fn cmd_status<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
-    let flags = parse_flags(args);
+    let flags = parse_flags(args)?;
     let workspace = flags
         .workspace
         .map(PathBuf::from)
@@ -557,7 +571,7 @@ fn preselect_for(id: QuestionId, a: &Answers) -> Vec<String> {
 
 /// `clear` — wipe the local workspace (no Docker/cloud changes).
 fn cmd_clear(args: &[String]) -> Result<()> {
-    let flags = parse_flags(args);
+    let flags = parse_flags(args)?;
     let workspace = flags
         .workspace
         .map(PathBuf::from)
@@ -577,7 +591,7 @@ fn cmd_clear(args: &[String]) -> Result<()> {
 /// then wipe the workspace. The local counterpart to MA's own `cleanup`; for
 /// the cloud path the operator runs `terraform destroy` on the emitted module.
 fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
-    let flags = parse_flags(args);
+    let flags = parse_flags(args)?;
     let workspace = flags
         .workspace
         .clone()
@@ -948,20 +962,37 @@ mod tests {
 
     #[test]
     fn parse_flags_reads_all_forms() {
-        let f = parse_flags(&args(&["-y", "--workspace", "/tmp/ws", "--dry-run"]));
+        let f = parse_flags(&args(&["-y", "--workspace", "/tmp/ws", "--dry-run"])).unwrap();
         assert!(f.non_interactive);
         assert!(f.dry_run);
         assert_eq!(f.workspace.as_deref(), Some("/tmp/ws"));
 
-        let f2 = parse_flags(&args(&["--workspace=/x", "--plan"]));
+        let f2 = parse_flags(&args(&["--workspace=/x", "--plan"])).unwrap();
         assert_eq!(f2.workspace.as_deref(), Some("/x"));
         assert!(f2.dry_run);
 
         // The cloud-apply opt-in (both spellings) and emit-only flag.
-        assert!(parse_flags(&args(&["--apply"])).apply);
-        assert!(parse_flags(&args(&["--auto-approve"])).apply);
-        assert!(parse_flags(&args(&["--no-apply"])).no_apply);
-        assert!(!parse_flags(&args(&["-y"])).apply);
+        assert!(parse_flags(&args(&["--apply"])).unwrap().apply);
+        assert!(parse_flags(&args(&["--auto-approve"])).unwrap().apply);
+        assert!(parse_flags(&args(&["--no-apply"])).unwrap().no_apply);
+        assert!(!parse_flags(&args(&["-y"])).unwrap().apply);
+    }
+
+    #[test]
+    fn parse_flags_rejects_value_flag_followed_by_a_flag() {
+        // `--workspace --dry-run` must NOT swallow --dry-run as the path.
+        let e = parse_flags(&args(&["--workspace", "--dry-run"])).unwrap_err();
+        assert_eq!(e.code, 64);
+        // A missing trailing value is the same usage error.
+        assert_eq!(parse_flags(&args(&["--workspace"])).unwrap_err().code, 64);
+        // The `=` form is unaffected.
+        assert_eq!(
+            parse_flags(&args(&["--workspace=/ok", "--dry-run"]))
+                .unwrap()
+                .workspace
+                .as_deref(),
+            Some("/ok")
+        );
     }
 
     #[test]

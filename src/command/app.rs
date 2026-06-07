@@ -193,11 +193,13 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
                     out.stderr.trim()
                 )))
             }
-            Action::WaitReady { role, .. } => {
+            Action::WaitReady { role, what } => {
                 let ctx = self.context_for(*role);
                 // Best-effort readiness wait; a timeout is not fatal to the
-                // demo (the operator can inspect pods), so we don't error out.
-                self.runner.run(
+                // demo (the operator can inspect pods), so we don't error out —
+                // but we DO surface it (instead of silently swallowing) with the
+                // inspect command, so a slow/stuck pod isn't mistaken for ready.
+                let out = self.runner.run(
                     "kubectl",
                     &[
                         "--context",
@@ -211,6 +213,13 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
                         "--timeout=300s",
                     ],
                 );
+                if !out.success() {
+                    self.progress.info(&format!(
+                        "warning: {what} not ready within timeout — inspect with: \
+                         kubectl --context {ctx} get pods -n {ns} (the dashboard will keep watching)",
+                        ns = manifests::NAMESPACE
+                    ));
+                }
                 Ok(())
             }
             Action::ProvisionAoss { collection } => self.provision_aoss(collection),
@@ -353,17 +362,45 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
     }
 
     /// Poll `batch-get-collection` until ACTIVE (or a bounded number of tries),
-    /// returning the collection endpoint. The runner's stubbed output drives
-    /// this under test.
+    /// returning the collection endpoint. Emits periodic progress so a multi-
+    /// second wait isn't silent, fails fast on an auth/credential error (no point
+    /// retrying a 403 for two minutes), and includes the last seen status/error
+    /// in the timeout message. The runner's stubbed output drives this under test.
     fn poll_aoss_active(&self, collection: &str, region: &str) -> Result<String> {
         let args = plan::aoss_batch_get_args(collection, region);
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        for _ in 0..40 {
+        let mut last = String::from("(no response yet)");
+        for attempt in 0..40 {
             let out = self.runner.run("aws", &argv);
             if out.success() {
                 if let Some(ep) = parse_aoss_endpoint(&out.stdout) {
                     return Ok(ep);
                 }
+                last = "CREATING".to_string();
+            } else {
+                let err = out.stderr.trim();
+                // Fail fast on credential/authorization errors — those won't
+                // resolve by waiting.
+                let lc = err.to_lowercase();
+                if lc.contains("expiredtoken")
+                    || lc.contains("not authorized")
+                    || lc.contains("accessdenied")
+                    || lc.contains("unable to locate credentials")
+                {
+                    return Err(Error::die(format!(
+                        "AOSS collection {collection} query failed (credentials/permissions): {err}"
+                    )));
+                }
+                if !err.is_empty() {
+                    last = err.to_string();
+                }
+            }
+            // Surface a heartbeat every few attempts so a real (~5s+) wait shows
+            // life rather than a frozen line.
+            if attempt > 0 && attempt % 3 == 0 {
+                self.progress.info(&format!(
+                    "waiting for AOSS {collection} to go ACTIVE… ({last})"
+                ));
             }
             // Under the real runner the orchestrator sleeps; the mock returns
             // immediately, so a successful ACTIVE parse exits on the first pass.
@@ -374,7 +411,7 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
             }
         }
         Err(Error::die(format!(
-            "AOSS collection {collection} did not reach ACTIVE in time"
+            "AOSS collection {collection} did not reach ACTIVE in time (last status: {last})"
         )))
     }
 
@@ -448,7 +485,10 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
             &[&format!("-chdir={tf_dir_str}"), "init", "-input=false"],
         );
         if !init.success() {
-            return Err(Error::die("terraform init failed (see the output above)."));
+            return Err(Error::die(format!(
+                "terraform init failed (exit {}); see the output above.",
+                init.status
+            )));
         }
         self.progress
             .step("terraform apply (cloud — this provisions real AWS resources)");
@@ -465,7 +505,14 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
             ],
         );
         if !apply.success() {
-            return Err(Error::die("terraform apply failed (see the output above)."));
+            // A partial apply may have created billable resources — point the
+            // operator at the cleanup so they aren't left paying for an
+            // abandoned half-stack.
+            return Err(Error::die(format!(
+                "terraform apply failed (exit {}); see the output above. Any partially-created \
+                 resources can be removed with:  terraform -chdir={tf_dir_str} destroy",
+                apply.status
+            )));
         }
         self.state.advance(Step::TargetUp);
         self.state.save()?;
@@ -542,11 +589,19 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
             )));
         }
 
-        // helm dependency update + upgrade --install.
+        // helm dependency update (non-fatal, but warn — a stale subchart cache
+        // is a common cause of a later install failure).
         let dep = plan::ma_helm_dependency_args(&chart);
         let dep_ref: Vec<&str> = dep.iter().map(String::as_str).collect();
-        self.runner.run("helm", &dep_ref);
+        let dep_out = self.runner.run("helm", &dep_ref);
+        if !dep_out.success() {
+            self.progress.info(&format!(
+                "warning: helm dependency update reported an error: {}",
+                dep_out.stderr.trim()
+            ));
+        }
 
+        // helm install is fatal — without it there's no MA to hand off to.
         let inst = plan::ma_helm_install_args(&chart, &ctx);
         let inst_ref: Vec<&str> = inst.iter().map(String::as_str).collect();
         let out = self.runner.run("helm", &inst_ref);
@@ -557,17 +612,27 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
             )));
         }
 
-        // Wait for the console statefulset (best-effort log; not fatal).
+        // Wait for the console statefulset. Non-fatal, but track readiness so the
+        // "deployed" line below is honest rather than claiming success blindly.
         let roll = plan::ma_rollout_status_args(&ctx);
         let roll_ref: Vec<&str> = roll.iter().map(String::as_str).collect();
-        self.runner.run("kubectl", &roll_ref);
+        let console_ready = self.runner.run("kubectl", &roll_ref).success();
 
         self.state.advance(Step::Ready);
         self.state.save()?;
-        self.progress.info(&format!(
-            "Migration Assistant deployed to KIND cluster {cluster} (namespace {})",
-            plan::MA_NAMESPACE
-        ));
+        if console_ready {
+            self.progress.info(&format!(
+                "Migration Assistant deployed to KIND cluster {cluster} (namespace {})",
+                plan::MA_NAMESPACE
+            ));
+        } else {
+            self.progress.info(&format!(
+                "Migration Assistant installed to KIND cluster {cluster} (namespace {}), but the \
+                 migration-console isn't ready yet — it may still be starting (the exec below \
+                 will wait, or watch it with `ma-demo status`).",
+                plan::MA_NAMESPACE
+            ));
+        }
         // The handoff: exec into the console. Prefix with `kubectl` for the dispatcher.
         let mut argv = vec!["kubectl".to_string()];
         argv.extend(plan::ma_console_exec_args(&ctx));
@@ -575,21 +640,24 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
     }
 
     /// Locate the opensearch-migrations helm chart: `MA_CHART_PATH` env wins;
-    /// else a sibling `opensearch-migrations` checkout next to the workspace's
-    /// parent. Errors with guidance if neither exists.
+    /// else a sibling `opensearch-migrations` checkout (next to the current dir
+    /// or to the workspace's parent — the common "two repos side by side"
+    /// layout). Errors with guidance if neither exists.
     fn resolve_ma_chart_path(&self) -> Result<String> {
         if let Ok(p) = std::env::var("MA_CHART_PATH") {
             if std::path::Path::new(&p).exists() {
                 return Ok(p);
             }
         }
-        // Common dev layout: a sibling clone of the repo.
-        for base in [
-            std::path::PathBuf::from("/Users/akurait/demo/opensearch-migrations"),
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join("../opensearch-migrations"),
-        ] {
+        // Portable sibling-checkout lookups (no machine-specific paths): a clone
+        // next to CWD, or next to the workspace's parent directory.
+        let mut bases = vec![std::env::current_dir()
+            .unwrap_or_default()
+            .join("../opensearch-migrations")];
+        if let Some(ws_parent) = self.state.dir().parent().and_then(|p| p.parent()) {
+            bases.push(ws_parent.join("opensearch-migrations"));
+        }
+        for base in bases {
             let chart = base.join(plan::MA_CHART_SUBPATH);
             if chart.exists() {
                 return Ok(chart.to_string_lossy().to_string());
