@@ -101,11 +101,15 @@ fn is_executable(_path: &std::path::Path) -> bool {
 
 /// One scripted response in a [`MockRunner`]: when the joined `program + args`
 /// string contains every substring in `match_all`, reply with this output.
+/// `remaining` bounds how many times the stub may fire (`None` = unlimited);
+/// once exhausted it is skipped, so later stubs / the default reply take over —
+/// this models recovery paths (fail once, then succeed).
 #[derive(Debug, Clone)]
 struct Stub {
     program: String,
     match_all: Vec<String>,
     output: Output,
+    remaining: Option<u32>,
 }
 
 /// A recorded invocation: the program and its joined arguments.
@@ -160,6 +164,7 @@ impl MockRunner {
                 stdout: stdout.to_string(),
                 stderr: String::new(),
             },
+            remaining: None,
         });
         self
     }
@@ -175,6 +180,31 @@ impl MockRunner {
                 stdout: String::new(),
                 stderr: stderr.to_string(),
             },
+            remaining: None,
+        });
+        self
+    }
+
+    /// Like [`stub_stderr`](Self::stub_stderr) but fires at most `times` before
+    /// being skipped — so a subsequent matching stub or the default reply takes
+    /// over. Models a recovery path (e.g. apply fails once, then succeeds).
+    pub fn stub_stderr_once(
+        self,
+        program: &str,
+        match_all: &[&str],
+        status: i32,
+        stderr: &str,
+        times: u32,
+    ) -> Self {
+        self.stubs.lock().unwrap().push(Stub {
+            program: program.to_string(),
+            match_all: match_all.iter().map(|s| s.to_string()).collect(),
+            output: Output {
+                status,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            },
+            remaining: Some(times),
         });
         self
     }
@@ -215,10 +245,16 @@ impl CommandRunner for MockRunner {
         });
 
         let joined = format!("{} {}", program, args.join(" "));
-        let stubs = self.stubs.lock().unwrap();
-        for stub in stubs.iter() {
+        let mut stubs = self.stubs.lock().unwrap();
+        for stub in stubs.iter_mut() {
             if stub.program == program && stub.match_all.iter().all(|m| joined.contains(m.as_str()))
             {
+                match stub.remaining {
+                    // Exhausted bounded stub — skip it, let later stubs/default win.
+                    Some(0) => continue,
+                    Some(n) => stub.remaining = Some(n - 1),
+                    None => {}
+                }
                 return stub.output.clone();
             }
         }
@@ -280,6 +316,22 @@ mod tests {
         let r = MockRunner::new().with_command("kind");
         assert!(r.has_command("kind"));
         assert!(!r.has_command("helm"));
+    }
+
+    #[test]
+    fn stub_once_fires_then_falls_through() {
+        // Fails once, then the default-0 reply takes over — the recovery model.
+        let r =
+            MockRunner::new().stub_stderr_once("kubectl", &["apply"], 1, "field is immutable", 1);
+        let first = r.run("kubectl", &["apply", "-f", "x.yaml"]);
+        assert_eq!(first.status, 1);
+        assert!(first.stderr.contains("immutable"));
+        let second = r.run("kubectl", &["apply", "-f", "x.yaml"]);
+        assert_eq!(
+            second.status, 0,
+            "second apply should fall through to default"
+        );
+        assert!(second.stderr.is_empty());
     }
 
     #[test]

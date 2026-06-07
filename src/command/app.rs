@@ -141,17 +141,45 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
                 let path =
                     self.write_artifact(&format!("{}-{name}.yaml", role_stem(*role)), body)?;
                 let ctx = self.context_for(*role);
-                let out = self.runner.run(
-                    "kubectl",
-                    &["--context", &ctx, "apply", "-f", &path.to_string_lossy()],
-                );
-                if !out.success() {
+                let path_str = path.to_string_lossy().to_string();
+                let out = self
+                    .runner
+                    .run("kubectl", &["--context", &ctx, "apply", "-f", &path_str]);
+                if out.success() {
+                    return Ok(());
+                }
+                // Resume/re-run robustness: some resources (notably Jobs) have an
+                // immutable pod template, so a plain `apply` of a changed spec is
+                // rejected. Recover by deleting then re-applying — idempotent for
+                // the run-it-again-until-it-works flow.
+                if Self::is_immutable_error(&out.stderr) {
+                    self.runner.run(
+                        "kubectl",
+                        &[
+                            "--context",
+                            &ctx,
+                            "delete",
+                            "-f",
+                            &path_str,
+                            "--ignore-not-found",
+                            "--wait=true",
+                        ],
+                    );
+                    let retry = self
+                        .runner
+                        .run("kubectl", &["--context", &ctx, "apply", "-f", &path_str]);
+                    if retry.success() {
+                        return Ok(());
+                    }
                     return Err(Error::die(format!(
-                        "kubectl apply {name} failed: {}",
-                        out.stderr.trim()
+                        "kubectl apply {name} failed after delete+retry: {}",
+                        retry.stderr.trim()
                     )));
                 }
-                Ok(())
+                Err(Error::die(format!(
+                    "kubectl apply {name} failed: {}",
+                    out.stderr.trim()
+                )))
             }
             Action::WaitReady { role, .. } => {
                 let ctx = self.context_for(*role);
@@ -265,6 +293,15 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
     /// re-run).
     fn already_exists(stderr: &str) -> bool {
         stderr.contains("already exist")
+    }
+
+    /// Whether a `kubectl apply` error is an immutable-field rejection — the
+    /// signal to recover by delete + re-apply. Jobs (immutable pod template) are
+    /// the common case when re-running the harness over an existing deployment.
+    fn is_immutable_error(stderr: &str) -> bool {
+        stderr.contains("field is immutable")
+            || stderr.contains("may not be changed")
+            || stderr.contains("updates to") && stderr.contains("are forbidden")
     }
 }
 
@@ -410,6 +447,39 @@ mod tests {
         app.state.plan.answers = full_answers();
         let err = app.provision(&full_answers()).unwrap_err();
         assert!(err.message.contains("kubectl apply"));
+    }
+
+    #[test]
+    fn immutable_apply_error_recovers_via_delete_then_retry() {
+        // The FIRST apply hits an immutable-field error (the Job re-run case);
+        // the orchestrator should delete and re-apply rather than hard-fail. The
+        // stub fires once, so the retry apply falls through to the default-0
+        // reply (success). Every later apply also succeeds by default.
+        let r = ready_runner().stub_stderr_once(
+            "kubectl",
+            &["apply"],
+            1,
+            "The Job \"data-seed\" is invalid: spec.template: field is immutable",
+            1,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let p = SilentProgress;
+        let mut app = App::new(&r, tmp.path(), &p);
+        app.state.plan.answers = full_answers();
+        // Provision should NOT error — the immutable apply is recovered.
+        assert!(app.provision(&full_answers()).is_ok());
+        // A delete was issued as part of the recovery.
+        assert!(r.any_call_contains("delete -f"));
+    }
+
+    #[test]
+    fn is_immutable_error_classifies_job_template_rejection() {
+        assert!(App::<MockRunner, SilentProgress>::is_immutable_error(
+            "spec.template: Invalid value: ...: field is immutable"
+        ));
+        assert!(!App::<MockRunner, SilentProgress>::is_immutable_error(
+            "connection refused"
+        ));
     }
 
     #[test]

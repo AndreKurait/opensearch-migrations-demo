@@ -60,28 +60,27 @@ pub fn namespace() -> String {
 
 /// A single-node Elasticsearch/OpenSearch StatefulSet + Service for the source.
 ///
-/// Security is disabled (single-node demo), discovery is single-node, and the
-/// requested `plugins` are installed by an initContainer via the engine's
-/// plugin CLI when non-empty. The Service exposes a NodePort so a KIND
-/// extraPortMapping can publish it to the host.
+/// Security is disabled (single-node demo) and discovery is single-node. When
+/// `plugins` are requested the container's command is overridden to install
+/// them via the engine's plugin CLI (into the engine's own plugins dir, so they
+/// actually load) and then `exec` the image's real entrypoint — preserving the
+/// bundled plugins, unlike a volume overlay. The Service exposes a NodePort so a
+/// KIND extraPortMapping can publish it to the host.
 pub fn http_source(answers: &Answers) -> String {
     let engine = answers
         .source_engine
         .expect("http_source requires an HTTP search engine");
     let version = answers.source_version.as_deref().unwrap_or("latest");
     let image = source_image(engine, version);
-    let plugin_cli = match engine {
-        SourceEngine::Elasticsearch => "elasticsearch-plugin",
-        SourceEngine::OpenSearch => "opensearch-plugin",
-        SourceEngine::Solr => unreachable!("solr is not an http source"),
-    };
     let (env, name) = match engine {
         SourceEngine::Elasticsearch => (es_env(), "source-elasticsearch"),
         SourceEngine::OpenSearch => (os_env(), "source-opensearch"),
-        SourceEngine::Solr => unreachable!(),
+        SourceEngine::Solr => unreachable!("solr is not an http source"),
     };
 
-    let init = plugin_init_container(plugin_cli, &answers.source_plugins, &image);
+    // When plugins are requested, override the command to install-then-exec;
+    // otherwise let the image's default entrypoint run.
+    let command = plugin_command(engine, &answers.source_plugins);
 
     format!(
         "apiVersion: v1\n\
@@ -115,20 +114,14 @@ pub fn http_source(answers: &Answers) -> String {
          \x20     labels:\n\
          \x20       app: {name}\n\
          \x20   spec:\n\
-         {init}\
          \x20     containers:\n\
          \x20       - name: {name}\n\
          \x20         image: {image}\n\
+         {command}\
          \x20         ports:\n\
          \x20           - containerPort: 9200\n\
          \x20         env:\n\
-         {env}\
-         \x20         volumeMounts:\n\
-         \x20           - name: plugins\n\
-         \x20             mountPath: /plugins-extra\n\
-         \x20     volumes:\n\
-         \x20       - name: plugins\n\
-         \x20         emptyDir: {{}}\n",
+         {env}",
     )
 }
 
@@ -167,23 +160,41 @@ fn env_pair(name: &str, value: &str) -> String {
     )
 }
 
-/// An initContainer that installs each plugin via the engine's plugin CLI into
-/// a shared volume, or empty string when no plugins were requested.
-fn plugin_init_container(plugin_cli: &str, plugins: &[String], image: &str) -> String {
+/// A `command:` override that installs each requested plugin into the engine's
+/// own plugins dir, then `exec`s the image's real entrypoint so the bundled
+/// plugins are preserved and the newly-installed ones load. Returns empty
+/// string (no override → default entrypoint) when no plugins were requested.
+///
+/// The plugin CLI and the entrypoint to exec differ per engine:
+///
+/// - Elasticsearch: `elasticsearch-plugin` + `/usr/local/bin/docker-entrypoint.sh eswrapper`
+/// - OpenSearch: `opensearch-plugin` + `./opensearch-docker-entrypoint.sh`
+///
+/// Both run as a single `sh -c` so the install completes before the server boots.
+fn plugin_command(engine: SourceEngine, plugins: &[String]) -> String {
     if plugins.is_empty() {
         return String::new();
     }
+    let (cli, entrypoint) = match engine {
+        SourceEngine::Elasticsearch => (
+            "elasticsearch-plugin",
+            "exec /usr/local/bin/docker-entrypoint.sh eswrapper",
+        ),
+        SourceEngine::OpenSearch => (
+            "opensearch-plugin",
+            "exec ./opensearch-docker-entrypoint.sh",
+        ),
+        SourceEngine::Solr => unreachable!("solr is not an http source"),
+    };
     let installs = plugins
         .iter()
-        .map(|p| format!("{plugin_cli} install --batch {p}"))
+        .map(|p| format!("{cli} install --batch {p}"))
         .collect::<Vec<_>>()
         .join(" && ");
+    let script = format!("{installs} && {entrypoint}");
     format!(
-        "\x20     initContainers:\n\
-         \x20       - name: install-plugins\n\
-         \x20         image: {image}\n\
-         \x20         command: [\"sh\", \"-c\", {}]\n",
-        yaml_quote(&installs)
+        "\x20         command: [\"sh\", \"-c\", {}]\n",
+        yaml_quote(&script)
     )
 }
 
@@ -432,10 +443,28 @@ pub fn sample_search_app(source_host: &str) -> String {
     )
 }
 
-/// A Kubernetes Job that runs the repo's DataGenerator against the source to
-/// seed sample indices (HTTP logs, geonames, nested, NYC taxis). Uses the
-/// published migration-console image, which bundles the generator.
+/// A Kubernetes Job that seeds sample indices into the source over its REST
+/// API, so the migration has real data to move. Self-contained: a small `curl`
+/// image waits for the source to be green, then bulk-loads a `demo-logs` index
+/// with a few hundred documents via the `_bulk` API. Deliberately dependency-
+/// free (no DataGenerator/console image, which needs a migration config) — the
+/// goal is simply visible, migratable data on the source.
 pub fn data_seed_job(source_host: &str) -> String {
+    // Wait for the source, then generate ~300 bulk docs with a tiny awk loop and
+    // POST them. ES and OpenSearch share the `_bulk` newline-delimited format.
+    let script = format!(
+        "echo 'waiting for {source_host}…'; \
+         until curl -sf http://{source_host}:9200 >/dev/null 2>&1; do sleep 3; done; \
+         echo 'source up; seeding demo-logs'; \
+         awk 'BEGIN{{for(i=0;i<300;i++){{\
+print \"{{\\\"index\\\":{{}}}}\"; \
+print \"{{\\\"user\\\":\" (i%100) \",\\\"msg\\\":\\\"demo log line \" i \"\\\",\\\"level\\\":\\\"info\\\"}}\"}}}}' > /tmp/bulk.ndjson; \
+         curl -s -H 'Content-Type: application/x-ndjson' \
+           -XPOST 'http://{source_host}:9200/demo-logs/_bulk?refresh=true' \
+           --data-binary @/tmp/bulk.ndjson > /tmp/out.json; \
+         echo 'seeded; doc count:'; \
+         curl -s 'http://{source_host}:9200/demo-logs/_count'"
+    );
     format!(
         "apiVersion: batch/v1\n\
          kind: Job\n\
@@ -443,18 +472,15 @@ pub fn data_seed_job(source_host: &str) -> String {
          \x20 name: data-seed\n\
          \x20 namespace: {NAMESPACE}\n\
          spec:\n\
-         \x20 backoffLimit: 2\n\
+         \x20 backoffLimit: 3\n\
          \x20 template:\n\
          \x20   spec:\n\
          \x20     restartPolicy: Never\n\
          \x20     containers:\n\
-         \x20       - name: data-generator\n\
-         \x20         image: public.ecr.aws/migrations/opensearch-migrations-console:3.3.1\n\
+         \x20       - name: data-seed\n\
+         \x20         image: curlimages/curl:8.10.1\n\
          \x20         command: [\"sh\", \"-c\", {}]\n",
-        yaml_quote(&format!(
-            "console -- data-generator --target-host http://{source_host}:9200 --docs-per-workload-count 1000 || \
-             echo 'data-generator finished'"
-        ))
+        yaml_quote(&script)
     )
 }
 
@@ -520,28 +546,31 @@ mod tests {
         assert!(y.contains("xpack.security.enabled"));
         assert!(y.contains("nodePort: 30920"));
         assert!(y.contains("kind: StatefulSet"));
-        // No plugins requested → no initContainer.
-        assert!(!y.contains("initContainers"));
+        // No plugins requested → no command override (default entrypoint runs).
+        assert!(!y.contains("command:"));
     }
 
     #[test]
-    fn http_source_emits_plugin_init_container_when_requested() {
+    fn http_source_emits_install_then_exec_command_when_plugins_requested() {
         let mut a = es_answers();
         a.source_plugins = vec!["repository-s3".into(), "analysis-icu".into()];
         let y = http_source(&a);
-        assert!(y.contains("initContainers"));
+        // Command override installs the plugins then execs the ES entrypoint.
+        assert!(y.contains("command: [\"sh\", \"-c\","));
         assert!(y.contains("elasticsearch-plugin install --batch repository-s3"));
         assert!(y.contains("analysis-icu"));
+        assert!(y.contains("exec /usr/local/bin/docker-entrypoint.sh eswrapper"));
     }
 
     #[test]
-    fn opensearch_source_uses_os_plugin_cli_and_env() {
+    fn opensearch_source_uses_os_plugin_cli_and_entrypoint() {
         let mut a = Answers::new();
         a.source_engine = Some(SourceEngine::OpenSearch);
         a.source_version = Some("2.15.0".into());
         a.source_plugins = vec!["analysis-icu".into()];
         let y = http_source(&a);
         assert!(y.contains("opensearch-plugin install --batch analysis-icu"));
+        assert!(y.contains("exec ./opensearch-docker-entrypoint.sh"));
         assert!(y.contains("DISABLE_SECURITY_PLUGIN"));
         assert!(y.contains("opensearchproject/opensearch:2.15.0"));
     }
@@ -597,10 +626,12 @@ mod tests {
     }
 
     #[test]
-    fn data_seed_job_uses_console_image_and_target_host() {
+    fn data_seed_job_bulk_loads_source_over_rest() {
         let y = data_seed_job("source-elasticsearch");
-        assert!(y.contains("public.ecr.aws/migrations/opensearch-migrations-console:3.3.1"));
-        assert!(y.contains("--target-host http://source-elasticsearch:9200"));
+        // Self-contained curl-based bulk loader (no console image, which needs a
+        // migration config). Waits for the source, then _bulk-loads demo-logs.
+        assert!(y.contains("curlimages/curl:8.10.1"));
+        assert!(y.contains("http://source-elasticsearch:9200/demo-logs/_bulk"));
         assert!(y.contains("kind: Job"));
     }
 

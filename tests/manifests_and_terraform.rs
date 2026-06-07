@@ -49,8 +49,9 @@ fn source_manifest_carries_engine_image_and_plugins() {
     let a = es_local();
     let y = manifests::source(&a);
     assert!(y.contains("docker.elastic.co/elasticsearch/elasticsearch:7.10.2"));
-    assert!(y.contains("initContainers"));
+    assert!(y.contains("command: [\"sh\", \"-c\","));
     assert!(y.contains("elasticsearch-plugin install --batch repository-s3"));
+    assert!(y.contains("exec /usr/local/bin/docker-entrypoint.sh eswrapper"));
     assert!(y.contains("analysis-icu"));
 }
 
@@ -112,9 +113,10 @@ fn cloud_path_emits_reviewable_terraform() {
 }
 
 #[test]
-fn data_seed_job_uses_published_console_image() {
+fn data_seed_job_bulk_loads_the_source() {
     let host = plan::source_service_name(SourceEngine::OpenSearch);
     let y = manifests::data_seed_job(host);
-    assert!(y.contains("public.ecr.aws/migrations/opensearch-migrations-console:3.3.1"));
-    assert!(y.contains(host));
+    // Self-contained curl bulk loader against the source's _bulk API.
+    assert!(y.contains("curlimages/curl:8.10.1"));
+    assert!(y.contains(&format!("http://{host}:9200/demo-logs/_bulk")));
 }
