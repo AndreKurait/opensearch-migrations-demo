@@ -125,9 +125,40 @@ impl TargetMode {
     }
     pub fn label(self) -> &'static str {
         match self {
-            TargetMode::Provision => "Provision a target OpenSearch cluster",
+            TargetMode::Provision => "Provision a migration target",
             TargetMode::LeaveToMa => "Leave the target to the Migration Assistant",
         }
+    }
+}
+
+/// Which kind of target to provision (only asked when `TargetMode::Provision`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetKind {
+    /// A self-managed OpenSearch cluster in a local KIND cluster.
+    KindOpenSearch,
+    /// An Amazon OpenSearch Serverless NextGen collection (cloud, scale-to-zero,
+    /// ~5s to ACTIVE). Stood up via the `aws opensearchserverless` CLI.
+    AossServerlessNextGen,
+}
+
+impl TargetKind {
+    pub fn id(self) -> &'static str {
+        match self {
+            TargetKind::KindOpenSearch => "kind-opensearch",
+            TargetKind::AossServerlessNextGen => "aoss-nextgen",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            TargetKind::KindOpenSearch => "Local OpenSearch (KIND cluster)",
+            TargetKind::AossServerlessNextGen => {
+                "Amazon OpenSearch Serverless — NextGen collection (cloud, fast)"
+            }
+        }
+    }
+    /// Whether this kind needs the local KIND target cluster stood up.
+    pub fn is_local(self) -> bool {
+        matches!(self, TargetKind::KindOpenSearch)
     }
 }
 
@@ -178,6 +209,10 @@ pub struct Answers {
     pub plugins_done: bool,
     pub snapshot_storage: Option<SnapshotStorage>,
     pub target_mode: Option<TargetMode>,
+    /// Which kind of target to provision (only set when `target_mode` is
+    /// `Provision`). `None` while unasked or when leaving the target to MA.
+    #[serde(default)]
+    pub target_kind: Option<TargetKind>,
     pub target_version: Option<String>,
     /// Client apps to deploy against the source.
     pub clients: Vec<ClientApp>,
@@ -217,6 +252,25 @@ impl Answers {
     /// Whether a given client app was selected.
     pub fn has_client(&self, c: ClientApp) -> bool {
         self.clients.contains(&c)
+    }
+
+    /// Whether the plan provisions a LOCAL (KIND) target cluster — true only
+    /// when provisioning a target whose kind is the local OpenSearch cluster.
+    /// An AOSS NextGen target is cloud, so it needs no second KIND cluster.
+    pub fn provisions_local_target(&self) -> bool {
+        self.target_mode == Some(TargetMode::Provision)
+            && self.target_kind.map(|k| k.is_local()).unwrap_or(true)
+    }
+
+    /// Whether the plan provisions an AOSS NextGen collection as the target.
+    pub fn provisions_aoss_target(&self) -> bool {
+        self.target_mode == Some(TargetMode::Provision)
+            && self.target_kind == Some(TargetKind::AossServerlessNextGen)
+    }
+
+    /// The AOSS collection name for the NextGen target (DNS-ish, ≤32 chars).
+    pub fn aoss_collection_name(&self) -> String {
+        format!("{}-target", Self::STACK)
     }
 
     /// A one-line human summary of the plan, for the review screen + logs.
@@ -267,6 +321,7 @@ mod tests {
         a.source_plugins = vec!["analysis-icu".into(), "repository-s3".into()];
         a.snapshot_storage = Some(SnapshotStorage::LocalStack);
         a.target_mode = Some(TargetMode::Provision);
+        a.target_kind = Some(TargetKind::AossServerlessNextGen);
         a.target_version = Some("3.3.0".into());
         a.clients = vec![ClientApp::Locust, ClientApp::SampleSearchApp];
         a.seed_data = Some(true);
@@ -274,6 +329,29 @@ mod tests {
         let json = serde_json::to_string(&a).unwrap();
         let back: Answers = serde_json::from_str(&json).unwrap();
         assert_eq!(a, back);
+    }
+
+    #[test]
+    fn target_kind_distinguishes_local_vs_aoss() {
+        let mut a = Answers::new();
+        a.target_mode = Some(TargetMode::Provision);
+        // Default (kind unset) is treated as the local OpenSearch cluster.
+        assert!(a.provisions_local_target());
+        assert!(!a.provisions_aoss_target());
+
+        a.target_kind = Some(TargetKind::AossServerlessNextGen);
+        assert!(!a.provisions_local_target());
+        assert!(a.provisions_aoss_target());
+        assert_eq!(a.aoss_collection_name(), "ma-demo-target");
+
+        a.target_kind = Some(TargetKind::KindOpenSearch);
+        assert!(a.provisions_local_target());
+        assert!(!a.provisions_aoss_target());
+
+        // Leaving the target to MA provisions neither.
+        a.target_mode = Some(TargetMode::LeaveToMa);
+        assert!(!a.provisions_local_target());
+        assert!(!a.provisions_aoss_target());
     }
 
     #[test]

@@ -59,13 +59,29 @@ under `bin/`. Re-running resumes from the saved plan.
 | **Source version** | per-engine (ES 5.6–8.17, OS 1.3–2.19, Solr 8–9) |
 | **Source plugins** | repository-s3, analysis-icu, … (multi-select) |
 | **Snapshot storage** | LocalStack (simulated S3) · real AWS S3 · none |
-| **Target cluster** | provision OpenSearch · leave it to the Migration Assistant |
-| **Target version** | OpenSearch 2.19 / 3.1 / 3.3 |
+| **Target** | provision a target · leave it to the Migration Assistant |
+| **Target kind** | local OpenSearch (KIND) · **Amazon OpenSearch Serverless NextGen** (cloud, fast) |
+| **Target version** | OpenSearch 2.19 / 3.1 / 3.3 (local KIND target only) |
 | **Client apps** | Locust load gen · sample search app (multi-select) |
-| **Seed data** | run DataGenerator workloads (yes/no) |
+| **Seed data** | seed sample documents into the source (yes/no) |
 
 The flow is adaptive — e.g. choosing *leave the target to the Migration
-Assistant* skips the target-version question entirely.
+Assistant* skips both the target-kind and target-version questions, and
+choosing the **AOSS NextGen** target kind skips the version question (a
+serverless collection takes no OpenSearch version).
+
+### Target kinds
+
+- **Local OpenSearch (KIND)** — a self-managed OpenSearch cluster in a second
+  KIND cluster (`ma-demo-target`, host port `localhost:29200`).
+- **Amazon OpenSearch Serverless — NextGen collection** — a managed cloud
+  collection that goes ACTIVE in ~5 seconds and scales to zero. The harness
+  drives the `aws opensearchserverless` control plane (NextGen group with
+  standby replicas, the encryption/network/data-access policies, then the
+  collection) and records the resolved `*.aoss.<region>.on.aws` endpoint.
+  Requires AWS CLI v2 (≥ 2.34.56) on PATH and credentials. **Note:** AOSS
+  data-plane requests with a body must send an explicit `X-Amz-Content-SHA256`
+  header (the payload hash) or they 403 — the sample client handles this.
 
 ## Subcommands
 

@@ -13,7 +13,8 @@
 //! path fills answers from defaults the same way.
 
 use crate::model::{
-    Answers, ClientApp, SnapshotStorage, SourceEngine, Target, TargetMode, TARGET_VERSIONS,
+    Answers, ClientApp, SnapshotStorage, SourceEngine, Target, TargetKind, TargetMode,
+    TARGET_VERSIONS,
 };
 
 /// The identity of each wizard question. Stable ids so the TUI, the
@@ -26,6 +27,8 @@ pub enum QuestionId {
     SourcePlugins,
     SnapshotStorage,
     TargetMode,
+    /// Which kind of target to provision (local KIND OpenSearch vs AOSS NextGen).
+    TargetKind,
     TargetVersion,
     Clients,
     SeedData,
@@ -84,13 +87,14 @@ pub enum Answer {
 /// The ordered list of *candidate* questions. [`next_question`] walks this in
 /// order and returns the first whose answer is still missing AND that applies
 /// given the current answers.
-const FLOW: [QuestionId; 9] = [
+const FLOW: [QuestionId; 10] = [
     QuestionId::Target,
     QuestionId::SourceEngine,
     QuestionId::SourceVersion,
     QuestionId::SourcePlugins,
     QuestionId::SnapshotStorage,
     QuestionId::TargetMode,
+    QuestionId::TargetKind,
     QuestionId::TargetVersion,
     QuestionId::Clients,
     QuestionId::SeedData,
@@ -100,9 +104,12 @@ const FLOW: [QuestionId; 9] = [
 /// apply are skipped (their value stays at its default).
 fn applies(q: QuestionId, a: &Answers) -> bool {
     match q {
-        // The target-version question only applies when we're provisioning a
-        // target cluster ourselves.
-        QuestionId::TargetVersion => a.target_mode == Some(TargetMode::Provision),
+        // The target-kind question only applies when provisioning a target.
+        QuestionId::TargetKind => a.target_mode == Some(TargetMode::Provision),
+        // The target-version question applies only when provisioning a LOCAL
+        // OpenSearch target — an AOSS NextGen collection takes no version, and
+        // leaving the target to MA needs no version either.
+        QuestionId::TargetVersion => a.provisions_local_target(),
         _ => true,
     }
 }
@@ -120,6 +127,7 @@ fn answered(q: QuestionId, a: &Answers) -> bool {
         QuestionId::SourcePlugins => a.plugins_done,
         QuestionId::SnapshotStorage => a.snapshot_storage.is_some(),
         QuestionId::TargetMode => a.target_mode.is_some(),
+        QuestionId::TargetKind => a.target_kind.is_some(),
         QuestionId::TargetVersion => a.target_version.is_some(),
         QuestionId::Clients => a.clients_done,
         QuestionId::SeedData => a.seed_data.is_some(),
@@ -202,17 +210,32 @@ pub fn build(id: QuestionId, a: &Answers) -> Question {
         },
         QuestionId::TargetMode => Question {
             id,
-            title: "Should the harness provision the TARGET OpenSearch cluster?".into(),
-            help: "Provision stands up an OpenSearch target in its own KIND cluster. Otherwise the Migration Assistant deploys / points at its own target.".into(),
+            title: "Should the harness provision the migration TARGET?".into(),
+            help: "Provision stands up a target you can pick (local OpenSearch or a cloud AOSS NextGen collection). Otherwise the Migration Assistant deploys / points at its own target.".into(),
             kind: Kind::SingleChoice(vec![
                 Choice::new(TargetMode::Provision.id(), TargetMode::Provision.label()),
                 Choice::new(TargetMode::LeaveToMa.id(), TargetMode::LeaveToMa.label()),
             ]),
         },
+        QuestionId::TargetKind => Question {
+            id,
+            title: "What kind of target should the harness provision?".into(),
+            help: "Local OpenSearch runs in a second KIND cluster. AOSS Serverless NextGen is a managed cloud collection that goes ACTIVE in ~5s and scales to zero — fastest to stand up.".into(),
+            kind: Kind::SingleChoice(vec![
+                Choice::new(
+                    TargetKind::KindOpenSearch.id(),
+                    TargetKind::KindOpenSearch.label(),
+                ),
+                Choice::new(
+                    TargetKind::AossServerlessNextGen.id(),
+                    TargetKind::AossServerlessNextGen.label(),
+                ),
+            ]),
+        },
         QuestionId::TargetVersion => Question {
             id,
             title: "Which target OpenSearch version?".into(),
-            help: "The OpenSearch version to stand up as the migration target.".into(),
+            help: "The OpenSearch version to stand up in the local KIND target cluster.".into(),
             kind: Kind::SingleChoice(
                 TARGET_VERSIONS.iter().map(|v| Choice::new(*v, *v)).collect(),
             ),
@@ -296,10 +319,21 @@ pub fn apply(a: &mut Answers, id: QuestionId, ans: Answer) -> QuestionId {
         }
         (QuestionId::TargetMode, Answer::Choice(c)) => {
             let mode = parse_target_mode(&c);
+            // Leaving the target to MA clears both the kind and the version.
             if mode == Some(TargetMode::LeaveToMa) {
+                a.target_kind = None;
                 a.target_version = None;
             }
             a.target_mode = mode;
+        }
+        (QuestionId::TargetKind, Answer::Choice(c)) => {
+            let kind = parse_target_kind(&c);
+            // An AOSS NextGen target takes no OpenSearch version — clear it so
+            // the version question is skipped.
+            if kind == Some(TargetKind::AossServerlessNextGen) {
+                a.target_version = None;
+            }
+            a.target_kind = kind;
         }
         (QuestionId::TargetVersion, Answer::Choice(c)) => {
             a.target_version = Some(c);
@@ -348,6 +382,13 @@ fn parse_target_mode(s: &str) -> Option<TargetMode> {
         _ => None,
     }
 }
+fn parse_target_kind(s: &str) -> Option<TargetKind> {
+    match s {
+        "kind-opensearch" => Some(TargetKind::KindOpenSearch),
+        "aoss-nextgen" => Some(TargetKind::AossServerlessNextGen),
+        _ => None,
+    }
+}
 fn parse_client(s: &str) -> Option<ClientApp> {
     match s {
         "locust" => Some(ClientApp::Locust),
@@ -375,7 +416,13 @@ pub fn fill_defaults(a: &mut Answers) {
     if a.target_mode.is_none() {
         a.target_mode = Some(TargetMode::Provision);
     }
-    if a.target_mode == Some(TargetMode::Provision) && a.target_version.is_none() {
+    // Default the target kind to the local KIND OpenSearch cluster when
+    // provisioning (the zero-cloud-dependency default).
+    if a.target_mode == Some(TargetMode::Provision) && a.target_kind.is_none() {
+        a.target_kind = Some(TargetKind::KindOpenSearch);
+    }
+    // Only a local OpenSearch target takes a version (AOSS NextGen doesn't).
+    if a.provisions_local_target() && a.target_version.is_none() {
         a.target_version = Some(TARGET_VERSIONS[0].to_string());
     }
     if a.seed_data.is_none() {
@@ -440,11 +487,21 @@ mod tests {
             ),
             QuestionId::TargetMode
         );
+        // Provision → now asks which KIND of target.
         assert_eq!(
             apply(
                 &mut a,
                 QuestionId::TargetMode,
                 Answer::Choice("provision".into())
+            ),
+            QuestionId::TargetKind
+        );
+        // Local OpenSearch → then asks the version.
+        assert_eq!(
+            apply(
+                &mut a,
+                QuestionId::TargetKind,
+                Answer::Choice("kind-opensearch".into())
             ),
             QuestionId::TargetVersion
         );
@@ -504,6 +561,47 @@ mod tests {
         );
         assert_eq!(next, QuestionId::Clients);
         assert!(a.target_version.is_none());
+    }
+
+    #[test]
+    fn aoss_nextgen_target_skips_version_question() {
+        let mut a = Answers::new();
+        apply(&mut a, QuestionId::Target, Answer::Choice("local".into()));
+        apply(
+            &mut a,
+            QuestionId::SourceEngine,
+            Answer::Choice("elasticsearch".into()),
+        );
+        apply(
+            &mut a,
+            QuestionId::SourceVersion,
+            Answer::Choice("7.10.2".into()),
+        );
+        apply(&mut a, QuestionId::SourcePlugins, Answer::Choices(vec![]));
+        apply(
+            &mut a,
+            QuestionId::SnapshotStorage,
+            Answer::Choice("none".into()),
+        );
+        // Provision → asks the kind.
+        assert_eq!(
+            apply(
+                &mut a,
+                QuestionId::TargetMode,
+                Answer::Choice("provision".into())
+            ),
+            QuestionId::TargetKind
+        );
+        // Choosing AOSS NextGen must skip the OpenSearch-version question.
+        let next = apply(
+            &mut a,
+            QuestionId::TargetKind,
+            Answer::Choice("aoss-nextgen".into()),
+        );
+        assert_eq!(next, QuestionId::Clients);
+        assert!(a.target_version.is_none());
+        assert!(a.provisions_aoss_target());
+        assert!(!a.provisions_local_target());
     }
 
     #[test]

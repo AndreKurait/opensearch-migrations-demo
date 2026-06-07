@@ -33,6 +33,8 @@ impl Script {
         s.answers
             .insert(QuestionId::SnapshotStorage, ans("localstack"));
         s.answers.insert(QuestionId::TargetMode, ans("provision"));
+        s.answers
+            .insert(QuestionId::TargetKind, ans("kind-opensearch"));
         s.answers.insert(QuestionId::TargetVersion, ans("3.3.0"));
         s.answers.insert(
             QuestionId::Clients,
@@ -125,6 +127,58 @@ fn full_run_provisions_and_installs_ma() {
     assert!(r.any_call_contains("AndreKurait/opensearch-migrations"));
     // Interactive run (no -y) execs the MA binary through the runner.
     assert!(r.any_call_contains("/migration-assistant"));
+}
+
+#[test]
+fn aoss_nextgen_target_provisions_via_aws_not_a_second_cluster() {
+    std::env::set_var("MA_DEMO_TEST", "1");
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let r = ready_runner()
+        .with_command("aws")
+        .stub(
+            "aws",
+            &["sts", "get-caller-identity"],
+            0,
+            "arn:aws:sts::874041194807:assumed-role/IibsAdminAccess-DO-NOT-DELETE/me",
+        )
+        .stub(
+            "aws",
+            &["batch-get-collection"],
+            0,
+            r#"{"collectionDetails":[{"status":"ACTIVE","collectionEndpoint":"https://xyz.aoss.us-east-1.on.aws","id":"xyz"}]}"#,
+        );
+    // A wizard that picks the AOSS NextGen target (skips target version).
+    let mut w = Script::new();
+    w.answers.insert(QuestionId::Target, ans("local"));
+    w.answers
+        .insert(QuestionId::SourceEngine, ans("elasticsearch"));
+    w.answers.insert(QuestionId::SourceVersion, ans("7.10.2"));
+    w.answers.insert(
+        QuestionId::SourcePlugins,
+        Outcome::Answered(Answer::Choices(vec![])),
+    );
+    w.answers.insert(QuestionId::SnapshotStorage, ans("none"));
+    w.answers.insert(QuestionId::TargetMode, ans("provision"));
+    w.answers
+        .insert(QuestionId::TargetKind, ans("aoss-nextgen"));
+    w.answers.insert(
+        QuestionId::Clients,
+        Outcome::Answered(Answer::Choices(vec![])),
+    );
+    w.answers
+        .insert(QuestionId::SeedData, Outcome::Answered(Answer::Bool(false)));
+
+    let code = cli::dispatch(&args(&["run", "--workspace", ws.to_str().unwrap()]), &r, &w);
+    assert_eq!(code, 0);
+    // Source KIND cluster yes; NO target KIND cluster.
+    assert!(r.any_call_contains("kind create cluster --name ma-demo-source"));
+    assert!(!r.any_call_contains("kind create cluster --name ma-demo-target"));
+    // AOSS NextGen collection provisioned via the aws CLI.
+    assert!(r.any_call_contains("create-collection-group"));
+    assert!(r.any_call_contains("--generation NEXTGEN"));
+    assert!(r.any_call_contains("create-collection"));
+    std::env::remove_var("MA_DEMO_TEST");
 }
 
 #[test]

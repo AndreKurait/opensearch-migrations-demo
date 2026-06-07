@@ -122,6 +122,8 @@ pub fn source_instance_tf(engine: SourceEngine, version: &str) -> String {
          \x20 ami                    = data.aws_ami.al2023.id\n\
          \x20 instance_type          = \"t3.large\"\n\
          \x20 vpc_security_group_ids = [aws_security_group.source.id]\n\
+         \x20 # GUARDRAIL: never assign a public IP (demo policy: no public EC2).\n\
+         \x20 associate_public_ip_address = false\n\
          \x20 user_data = <<-EOF\n\
          \x20   #!/bin/bash\n\
          \x20   dnf install -y docker\n\
@@ -130,6 +132,14 @@ pub fn source_instance_tf(engine: SourceEngine, version: &str) -> String {
          \x20   docker run -d --restart=always {run_args} {image}\n\
          \x20 EOF\n\
          \x20 tags = {{ Name = \"${{var.prefix}}-source\" }}\n\
+         }}\n\
+         \n\
+         # Fail the plan if a public IP is ever requested on the source instance.\n\
+         check \"no_public_ip\" {{\n\
+         \x20 assert {{\n\
+         \x20   condition     = aws_instance.source.associate_public_ip_address == false\n\
+         \x20   error_message = \"The source instance must never have a public IP (demo policy: no public EC2).\"\n\
+         \x20 }}\n\
          }}\n\
          \n\
          output \"source_endpoint\" {{\n\
@@ -257,6 +267,36 @@ mod tests {
         let solr = source_instance_tf(SourceEngine::Solr, "9.7.0");
         assert!(solr.contains("solr:9.7.0"));
         assert!(solr.contains("8983:8983"));
+    }
+
+    #[test]
+    fn source_instance_forbids_a_public_ip() {
+        // The guardrail: emitted source instances must never get a public IP,
+        // and a check block enforces it at plan time.
+        for eng in [
+            SourceEngine::Elasticsearch,
+            SourceEngine::OpenSearch,
+            SourceEngine::Solr,
+        ] {
+            let tf = source_instance_tf(eng, "1.2.3");
+            assert!(
+                tf.contains("associate_public_ip_address = false"),
+                "{} instance must disable public IP",
+                eng.id()
+            );
+            assert!(
+                tf.contains("check \"no_public_ip\""),
+                "{} must carry the no-public-ip guard",
+                eng.id()
+            );
+            // No 0.0.0.0/0 INGRESS (egress 0.0.0.0/0 is fine for the image pull).
+            assert!(
+                !tf.contains(
+                    "cidr_blocks = [\"0.0.0.0/0\"]\n         \x20 }}\n         \x20 egress"
+                ),
+                "ingress must not be open to the world"
+            );
+        }
     }
 
     #[test]

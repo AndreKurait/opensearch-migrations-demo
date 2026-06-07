@@ -201,7 +201,121 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
                 );
                 Ok(())
             }
+            Action::ProvisionAoss { collection } => self.provision_aoss(collection),
         }
+    }
+
+    /// Provision an AOSS NextGen collection via the `aws opensearchserverless`
+    /// control plane: collection group (NextGen, standby ENABLED), the three
+    /// policies, then the collection. Records the resolved endpoint in state.
+    /// Every call goes through the runner, so this is asserted against the mock.
+    fn provision_aoss(&mut self, collection: &str) -> Result<()> {
+        if !self.runner.has_command("aws") {
+            return Err(Error::die(
+                "aws CLI not found on PATH; required for the AOSS NextGen target. \
+                 Install AWS CLI v2 (>= 2.34.56) and authenticate.",
+            ));
+        }
+        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| plan::AOSS_REGION.to_string());
+        let principal = self.aws_principal_arn();
+
+        // The collection group must exist before the collection. "already
+        // exists" / "ConflictException" make re-runs idempotent.
+        let steps: [(&str, Vec<String>); 5] = [
+            (
+                "collection group",
+                plan::aoss_create_group_args(collection, &region),
+            ),
+            (
+                "encryption policy",
+                plan::aoss_encryption_policy_args(collection, &region),
+            ),
+            (
+                "network policy",
+                plan::aoss_network_policy_args(collection, &region),
+            ),
+            (
+                "data access policy",
+                plan::aoss_data_policy_args(collection, &region, &principal),
+            ),
+            (
+                "collection",
+                plan::aoss_create_collection_args(collection, &region),
+            ),
+        ];
+        for (what, args) in &steps {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = self.runner.run("aws", &argv);
+            if !out.success() && !Self::aoss_already_exists(&out.stderr) {
+                return Err(Error::die(format!(
+                    "AOSS {what} create failed: {}",
+                    out.stderr.trim()
+                )));
+            }
+        }
+
+        // Poll the collection to ACTIVE and capture the endpoint.
+        let endpoint = self.poll_aoss_active(collection, &region)?;
+        self.state.plan.aoss_endpoint = Some(endpoint);
+        self.state.advance(Step::TargetUp);
+        self.state.save()?;
+        Ok(())
+    }
+
+    /// Resolve the caller's IAM principal ARN (for the data access policy).
+    /// Falls back to a wildcard-free placeholder the operator can edit if STS
+    /// is unavailable through the runner.
+    fn aws_principal_arn(&self) -> String {
+        let out = self.runner.run(
+            "aws",
+            &[
+                "sts",
+                "get-caller-identity",
+                "--query",
+                "Arn",
+                "--output",
+                "text",
+            ],
+        );
+        let arn = out.trimmed_stdout().trim().to_string();
+        // Normalize an assumed-role ARN to its role ARN, which is what AOSS data
+        // access policies expect: sts::ACCT:assumed-role/ROLE/SESSION ->
+        // iam::ACCT:role/ROLE.
+        if let Some(rest) = arn.strip_prefix("arn:aws:sts::") {
+            if let Some((acct, tail)) = rest.split_once(':') {
+                if let Some(role_path) = tail.strip_prefix("assumed-role/") {
+                    let role = role_path.split('/').next().unwrap_or(role_path);
+                    return format!("arn:aws:iam::{acct}:role/{role}");
+                }
+            }
+        }
+        arn
+    }
+
+    /// Poll `batch-get-collection` until ACTIVE (or a bounded number of tries),
+    /// returning the collection endpoint. The runner's stubbed output drives
+    /// this under test.
+    fn poll_aoss_active(&self, collection: &str, region: &str) -> Result<String> {
+        let args = plan::aoss_batch_get_args(collection, region);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        for _ in 0..40 {
+            let out = self.runner.run("aws", &argv);
+            if out.success() {
+                if let Some(ep) = parse_aoss_endpoint(&out.stdout) {
+                    return Ok(ep);
+                }
+            }
+            // Under the real runner the orchestrator sleeps; the mock returns
+            // immediately, so a successful ACTIVE parse exits on the first pass.
+            if std::env::var("MA_DEMO_TEST").is_err() {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            } else {
+                break;
+            }
+        }
+        Err(Error::die(format!(
+            "AOSS collection {collection} did not reach ACTIVE in time"
+        )))
     }
 
     /// The kubectl context for a cluster role, derived from the plan's cluster
@@ -303,6 +417,30 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
             || stderr.contains("may not be changed")
             || stderr.contains("updates to") && stderr.contains("are forbidden")
     }
+
+    /// Whether an AOSS create error means the resource already exists — makes
+    /// the AOSS provisioning idempotent across re-runs.
+    fn aoss_already_exists(stderr: &str) -> bool {
+        stderr.contains("ConflictException")
+            || stderr.contains("already exists")
+            || stderr.contains("already exist")
+    }
+}
+
+/// Parse the collection endpoint out of an `aws ... batch-get-collection` JSON
+/// response, returning it only when the collection is ACTIVE. Pure, so the
+/// poll logic is unit-tested against canned CLI output.
+pub fn parse_aoss_endpoint(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let details = v.get("collectionDetails")?.as_array()?;
+    let first = details.first()?;
+    if first.get("status")?.as_str()? != "ACTIVE" {
+        return None;
+    }
+    first
+        .get("collectionEndpoint")?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 fn role_stem(role: ClusterRole) -> &'static str {
@@ -526,5 +664,94 @@ mod tests {
     #[test]
     fn kube_context_prefixes_with_kind() {
         assert_eq!(kube_context("ma-demo-source"), "kind-ma-demo-source");
+    }
+
+    #[test]
+    fn parse_aoss_endpoint_only_when_active() {
+        let active = r#"{"collectionDetails":[{"status":"ACTIVE","collectionEndpoint":"https://abc.aoss.us-east-1.on.aws","id":"abc"}]}"#;
+        assert_eq!(
+            parse_aoss_endpoint(active).as_deref(),
+            Some("https://abc.aoss.us-east-1.on.aws")
+        );
+        let creating = r#"{"collectionDetails":[{"status":"CREATING","id":"abc"}]}"#;
+        assert!(parse_aoss_endpoint(creating).is_none());
+        assert!(parse_aoss_endpoint("not json").is_none());
+        assert!(parse_aoss_endpoint(r#"{"collectionDetails":[]}"#).is_none());
+    }
+
+    #[test]
+    fn aoss_already_exists_classifies_conflict() {
+        assert!(App::<MockRunner, SilentProgress>::aoss_already_exists(
+            "ConflictException: resource already exists"
+        ));
+        assert!(!App::<MockRunner, SilentProgress>::aoss_already_exists(
+            "AccessDeniedException"
+        ));
+    }
+
+    fn aoss_answers() -> Answers {
+        let mut a = full_answers();
+        a.target_kind = Some(crate::model::TargetKind::AossServerlessNextGen);
+        a.target_version = None;
+        a
+    }
+
+    /// A mock that satisfies the AOSS control-plane flow: aws present, every
+    /// create returns 0, and batch-get returns an ACTIVE collection with an
+    /// endpoint. `MA_DEMO_TEST` short-circuits the poll sleep.
+    fn aoss_runner() -> MockRunner {
+        ready_runner()
+            .with_command("aws")
+            .stub(
+                "aws",
+                &["sts", "get-caller-identity"],
+                0,
+                "arn:aws:sts::874041194807:assumed-role/IibsAdminAccess-DO-NOT-DELETE/me",
+            )
+            .stub(
+                "aws",
+                &["batch-get-collection"],
+                0,
+                r#"{"collectionDetails":[{"status":"ACTIVE","collectionEndpoint":"https://xyz.aoss.us-east-1.on.aws","id":"xyz"}]}"#,
+            )
+    }
+
+    #[test]
+    fn provision_aoss_drives_control_plane_and_records_endpoint() {
+        std::env::set_var("MA_DEMO_TEST", "1");
+        let r = aoss_runner();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = SilentProgress;
+        let mut app = App::new(&r, tmp.path(), &p);
+        app.state.plan.answers = aoss_answers();
+        app.provision(&aoss_answers()).unwrap();
+
+        // NextGen group + collection created; no target KIND cluster.
+        assert!(r.any_call_contains("create-collection-group"));
+        assert!(r.any_call_contains("--generation NEXTGEN"));
+        assert!(r.any_call_contains("create-collection"));
+        assert!(!r.any_call_contains("kind create cluster --name ma-demo-target"));
+        // Endpoint captured into state, and the data policy got the ROLE arn
+        // (normalized from the assumed-role STS arn).
+        assert_eq!(
+            app.state.plan.aoss_endpoint.as_deref(),
+            Some("https://xyz.aoss.us-east-1.on.aws")
+        );
+        assert!(r.any_call_contains("arn:aws:iam::874041194807:role/IibsAdminAccess-DO-NOT-DELETE"));
+        std::env::remove_var("MA_DEMO_TEST");
+    }
+
+    #[test]
+    fn provision_aoss_without_aws_cli_errors() {
+        std::env::set_var("MA_DEMO_TEST", "1");
+        // ready_runner has no aws command registered.
+        let r = ready_runner();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = SilentProgress;
+        let mut app = App::new(&r, tmp.path(), &p);
+        app.state.plan.answers = aoss_answers();
+        let err = app.provision(&aoss_answers()).unwrap_err();
+        assert!(err.message.contains("aws CLI not found"));
+        std::env::remove_var("MA_DEMO_TEST");
     }
 }

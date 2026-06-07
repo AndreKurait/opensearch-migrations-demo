@@ -69,6 +69,10 @@ impl Step {
 pub struct Plan {
     pub answers: Answers,
     pub step: Step,
+    /// The resolved AOSS collection endpoint, once an AOSS NextGen target has
+    /// been provisioned (`None` otherwise). Surfaced to the operator + MA.
+    #[serde(default)]
+    pub aoss_endpoint: Option<String>,
 }
 
 impl Default for Plan {
@@ -76,6 +80,7 @@ impl Default for Plan {
         Self {
             answers: Answers::new(),
             step: Step::Planned,
+            aoss_endpoint: None,
         }
     }
 }

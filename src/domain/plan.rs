@@ -8,7 +8,7 @@
 //! for any set of answers is asserted in unit tests with no Docker.
 
 use crate::manifests;
-use crate::model::{Answers, SnapshotStorage, SourceEngine, Target, TargetMode};
+use crate::model::{Answers, SnapshotStorage, SourceEngine, Target};
 
 /// The fork release the harness installs the Migration Assistant CLI from.
 pub const MA_REPO: &str = "AndreKurait/opensearch-migrations";
@@ -43,6 +43,10 @@ pub enum Action {
     /// Wait for a rollout/condition (a kubectl wait) — described for the user;
     /// the orchestrator decides the exact wait args.
     WaitReady { role: ClusterRole, what: String },
+    /// Provision an Amazon OpenSearch Serverless NextGen collection as the
+    /// target (cloud). The orchestrator drives the `aws opensearchserverless`
+    /// control-plane calls; `collection` is the collection name.
+    ProvisionAoss { collection: String },
 }
 
 impl Action {
@@ -57,6 +61,9 @@ impl Action {
             }
             Action::WaitReady { role, what } => {
                 format!("wait for {what} ({})", role_label(*role))
+            }
+            Action::ProvisionAoss { collection } => {
+                format!("provision AOSS NextGen collection {collection}")
             }
         }
     }
@@ -155,8 +162,9 @@ pub fn build(answers: &Answers) -> ProvisionPlan {
         });
     }
 
-    // ---- target cluster (optional) ----
-    if answers.target_mode == Some(TargetMode::Provision) {
+    // ---- target (optional) — kind depends on the chosen target_kind ----
+    if answers.provisions_local_target() {
+        // Local OpenSearch in its own KIND cluster.
         let tgt_cluster = answers.target_cluster();
         let ver = answers.target_version.as_deref().unwrap_or("3.3.0");
         actions.push(Action::CreateKindCluster {
@@ -179,6 +187,13 @@ pub fn build(answers: &Answers) -> ProvisionPlan {
             what: "target cluster".into(),
         });
         target_host = Some("target-opensearch".to_string());
+    } else if answers.provisions_aoss_target() {
+        // Cloud AOSS NextGen collection — no KIND cluster; the orchestrator
+        // drives the control-plane via `aws opensearchserverless`. The endpoint
+        // is only known after creation, so target_host stays None here.
+        actions.push(Action::ProvisionAoss {
+            collection: answers.aoss_collection_name(),
+        });
     }
 
     ProvisionPlan {
@@ -213,10 +228,173 @@ pub fn ma_launch_argv(bin_dir: &str) -> Vec<String> {
     vec![format!("{bin_dir}/migration-assistant")]
 }
 
+// ---------------------------------------------------------------------------
+// AOSS NextGen target — control-plane command sequences (pure data).
+//
+// These mirror the verified live flow: a NextGen collection group (standby
+// ENABLED), the three security/access policies, then the collection. The
+// orchestrator runs each through the CommandRunner seam and polls for ACTIVE.
+// Pure builders so the exact argv is asserted without touching AWS.
+// ---------------------------------------------------------------------------
+
+/// The default region for the AOSS target. Overridable by the orchestrator via
+/// the `AWS_REGION` env at run time; baked here for the command builders.
+pub const AOSS_REGION: &str = "us-east-1";
+
+/// The collection group name for a given collection (NextGen groups collections).
+pub fn aoss_group_name(collection: &str) -> String {
+    format!("cg-{collection}")
+}
+
+/// `aws opensearchserverless create-collection-group …` argv (NextGen, standby
+/// ENABLED — both required for a genuine NextGen group).
+pub fn aoss_create_group_args(collection: &str, region: &str) -> Vec<String> {
+    vec![
+        "opensearchserverless".into(),
+        "create-collection-group".into(),
+        "--region".into(),
+        region.into(),
+        "--name".into(),
+        aoss_group_name(collection),
+        "--standby-replicas".into(),
+        "ENABLED".into(),
+        "--generation".into(),
+        "NEXTGEN".into(),
+    ]
+}
+
+/// The encryption-policy create argv (AWS-owned key, scoped to the collection).
+pub fn aoss_encryption_policy_args(collection: &str, region: &str) -> Vec<String> {
+    let policy = format!(
+        r#"{{"Rules":[{{"ResourceType":"collection","Resource":["collection/{collection}"]}}],"AWSOwnedKey":true}}"#
+    );
+    vec![
+        "opensearchserverless".into(),
+        "create-security-policy".into(),
+        "--region".into(),
+        region.into(),
+        "--name".into(),
+        format!("{collection}-enc"),
+        "--type".into(),
+        "encryption".into(),
+        "--policy".into(),
+        policy,
+    ]
+}
+
+/// The network-policy create argv (public access for the demo target).
+pub fn aoss_network_policy_args(collection: &str, region: &str) -> Vec<String> {
+    let policy = format!(
+        r#"[{{"Rules":[{{"ResourceType":"dashboard","Resource":["collection/{collection}"]}},{{"ResourceType":"collection","Resource":["collection/{collection}"]}}],"AllowFromPublic":true}}]"#
+    );
+    vec![
+        "opensearchserverless".into(),
+        "create-security-policy".into(),
+        "--region".into(),
+        region.into(),
+        "--name".into(),
+        format!("{collection}-net"),
+        "--type".into(),
+        "network".into(),
+        "--policy".into(),
+        policy,
+    ]
+}
+
+/// The data-access-policy create argv granting the migration principal the
+/// data-plane perms it needs (collection + index resources).
+pub fn aoss_data_policy_args(collection: &str, region: &str, principal_arn: &str) -> Vec<String> {
+    let policy = format!(
+        r#"[{{"Rules":[{{"ResourceType":"collection","Resource":["collection/{collection}"],"Permission":["aoss:CreateCollectionItems","aoss:DeleteCollectionItems","aoss:UpdateCollectionItems","aoss:DescribeCollectionItems"]}},{{"ResourceType":"index","Resource":["index/{collection}/*"],"Permission":["aoss:CreateIndex","aoss:DeleteIndex","aoss:UpdateIndex","aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument"]}}],"Principal":["{principal_arn}"]}}]"#
+    );
+    vec![
+        "opensearchserverless".into(),
+        "create-access-policy".into(),
+        "--region".into(),
+        region.into(),
+        "--name".into(),
+        format!("{collection}-data"),
+        "--type".into(),
+        "data".into(),
+        "--policy".into(),
+        policy,
+    ]
+}
+
+/// The collection create argv (SEARCH type, NextGen group, standby ENABLED).
+pub fn aoss_create_collection_args(collection: &str, region: &str) -> Vec<String> {
+    vec![
+        "opensearchserverless".into(),
+        "create-collection".into(),
+        "--region".into(),
+        region.into(),
+        "--name".into(),
+        collection.into(),
+        "--type".into(),
+        "SEARCH".into(),
+        "--collection-group-name".into(),
+        aoss_group_name(collection),
+        "--standby-replicas".into(),
+        "ENABLED".into(),
+    ]
+}
+
+/// The batch-get argv used to poll the collection to ACTIVE + read its endpoint.
+pub fn aoss_batch_get_args(collection: &str, region: &str) -> Vec<String> {
+    vec![
+        "opensearchserverless".into(),
+        "batch-get-collection".into(),
+        "--region".into(),
+        region.into(),
+        "--names".into(),
+        collection.into(),
+    ]
+}
+
+/// `delete-collection` argv (needs the collection ID, not the name).
+pub fn aoss_delete_collection_args(collection_id: &str, region: &str) -> Vec<String> {
+    vec![
+        "opensearchserverless".into(),
+        "delete-collection".into(),
+        "--region".into(),
+        region.into(),
+        "--id".into(),
+        collection_id.into(),
+    ]
+}
+
+/// `delete-security-policy` argv for one policy type (encryption|network).
+pub fn aoss_delete_security_policy_args(name: &str, ptype: &str, region: &str) -> Vec<String> {
+    vec![
+        "opensearchserverless".into(),
+        "delete-security-policy".into(),
+        "--region".into(),
+        region.into(),
+        "--name".into(),
+        name.into(),
+        "--type".into(),
+        ptype.into(),
+    ]
+}
+
+/// `delete-access-policy` argv for the data policy.
+pub fn aoss_delete_access_policy_args(name: &str, region: &str) -> Vec<String> {
+    vec![
+        "opensearchserverless".into(),
+        "delete-access-policy".into(),
+        "--region".into(),
+        region.into(),
+        "--name".into(),
+        name.into(),
+        "--type".into(),
+        "data".into(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ClientApp, SnapshotStorage};
+    use crate::model::{ClientApp, SnapshotStorage, TargetKind, TargetMode};
 
     fn base() -> Answers {
         let mut a = Answers::new();
@@ -280,6 +458,56 @@ mod tests {
         let d = describes(&plan);
         assert!(!d.iter().any(|s| s.contains("target cluster")));
         assert!(plan.target_host.is_none());
+    }
+
+    #[test]
+    fn aoss_target_emits_provision_action_not_a_kind_cluster() {
+        let mut a = base();
+        a.target_kind = Some(TargetKind::AossServerlessNextGen);
+        a.target_version = None;
+        let plan = build(&a);
+        let d = describes(&plan);
+        // No SECOND (target) KIND cluster — the source one still exists.
+        assert!(!d
+            .iter()
+            .any(|s| s.contains("create KIND cluster ma-demo-target")));
+        // A ProvisionAoss action is present for the collection.
+        assert!(d
+            .iter()
+            .any(|s| s.contains("provision AOSS NextGen collection ma-demo-target")));
+        // The endpoint isn't known until creation, so target_host stays None.
+        assert!(plan.target_host.is_none());
+        assert!(matches!(
+            plan.actions.last(),
+            Some(Action::ProvisionAoss { .. })
+        ));
+    }
+
+    #[test]
+    fn local_kind_target_still_builds_second_cluster() {
+        let mut a = base();
+        a.target_kind = Some(TargetKind::KindOpenSearch);
+        let plan = build(&a);
+        let d = describes(&plan);
+        assert!(d
+            .iter()
+            .any(|s| s.contains("create KIND cluster ma-demo-target")));
+        assert!(!d.iter().any(|s| s.contains("AOSS")));
+        assert_eq!(plan.target_host.as_deref(), Some("target-opensearch"));
+    }
+
+    #[test]
+    fn aoss_command_builders_match_verified_live_flow() {
+        let g = aoss_create_group_args("ma-demo-target", "us-east-1");
+        assert!(g.contains(&"create-collection-group".to_string()));
+        assert!(g.contains(&"NEXTGEN".to_string()));
+        assert!(g.contains(&"ENABLED".to_string()));
+        let c = aoss_create_collection_args("ma-demo-target", "us-east-1");
+        assert!(c.contains(&"SEARCH".to_string()));
+        assert!(c.contains(&"cg-ma-demo-target".to_string()));
+        let dp = aoss_data_policy_args("ma-demo-target", "us-east-1", "arn:aws:iam::1:role/R");
+        assert!(dp.iter().any(|s| s.contains("aoss:WriteDocument")));
+        assert!(dp.iter().any(|s| s.contains("arn:aws:iam::1:role/R")));
     }
 
     #[test]

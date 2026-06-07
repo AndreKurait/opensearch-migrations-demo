@@ -186,7 +186,7 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
     app.state.plan.answers = answers.clone();
     app.preflight(&answers)?;
     let plan = app.provision(&answers)?;
-    print_endpoints(&plan, &answers);
+    print_endpoints(&plan, &answers, app.state.plan.aoss_endpoint.as_deref());
 
     // Install the Migration Assistant CLI and hand off.
     let argv = app.install_ma()?;
@@ -289,6 +289,11 @@ fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
     let answers = Answers::new();
     ui::banner("Destroy local demo environment");
 
+    // Load the saved plan (if any) to see whether an AOSS target was provisioned.
+    let mut state = State::new(&workspace);
+    let _ = state.load();
+    let provisioned_aoss = state.plan.answers.provisions_aoss_target();
+
     if !runner.has_command("kind") {
         ui::warn("kind not on PATH; skipping cluster deletion");
     } else {
@@ -307,12 +312,69 @@ fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
         }
     }
 
+    // Tear down the AOSS NextGen target (collection → group → policies), if one
+    // was provisioned and the aws CLI is available.
+    if provisioned_aoss {
+        destroy_aoss(runner, &state.plan.answers.aoss_collection_name());
+    }
+
     if workspace.exists() {
         std::fs::remove_dir_all(&workspace)?;
         ui::ok("workspace cleared");
     }
-    ui::dim("  (cloud) for an AWS deploy, run `terraform destroy` in terraform/");
+    ui::dim("  (cloud) for a Terraform deploy, run `terraform destroy` in terraform/");
     Ok(())
+}
+
+/// Tear down an AOSS NextGen target in reverse-dependency order: resolve the
+/// collection ID, delete the collection, then the policies. Best-effort + idem-
+/// potent — missing resources are not fatal (the workspace wipe still proceeds).
+fn destroy_aoss<R: CommandRunner>(runner: &R, collection: &str) {
+    if !runner.has_command("aws") {
+        ui::warn("aws CLI not on PATH; skipping AOSS teardown");
+        return;
+    }
+    let region =
+        std::env::var("AWS_REGION").unwrap_or_else(|_| crate::plan::AOSS_REGION.to_string());
+    ui::step(&format!("delete AOSS collection {collection}"));
+
+    // Resolve the collection ID from its name (delete-collection wants the ID).
+    let bg = crate::plan::aoss_batch_get_args(collection, &region);
+    let bg_ref: Vec<&str> = bg.iter().map(String::as_str).collect();
+    let out = runner.run("aws", &bg_ref);
+    if let Some(id) = parse_aoss_id(&out.stdout) {
+        let del = crate::plan::aoss_delete_collection_args(&id, &region);
+        let del_ref: Vec<&str> = del.iter().map(String::as_str).collect();
+        let r = runner.run("aws", &del_ref);
+        if r.success() {
+            ui::ok(&format!("collection {collection} deleted"));
+        } else {
+            ui::warn(&format!("collection delete: {}", r.stderr.trim()));
+        }
+    } else {
+        ui::dim("  collection not found (already gone)");
+    }
+
+    // Policies (best-effort; names are deterministic from the collection name).
+    for (name, ptype) in [
+        (format!("{collection}-enc"), "encryption"),
+        (format!("{collection}-net"), "network"),
+    ] {
+        let a = crate::plan::aoss_delete_security_policy_args(&name, ptype, &region);
+        let aref: Vec<&str> = a.iter().map(String::as_str).collect();
+        runner.run("aws", &aref);
+    }
+    let dp = crate::plan::aoss_delete_access_policy_args(&format!("{collection}-data"), &region);
+    let dpref: Vec<&str> = dp.iter().map(String::as_str).collect();
+    runner.run("aws", &dpref);
+    ui::dim("  AOSS policies + collection group left for `aws` to GC (group deletes once empty)");
+}
+
+/// Parse the collection ID out of a `batch-get-collection` response (any status).
+fn parse_aoss_id(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let details = v.get("collectionDetails")?.as_array()?;
+    details.first()?.get("id")?.as_str().map(|s| s.to_string())
 }
 
 /// Print the human plan summary (the review screen's text form).
@@ -335,8 +397,11 @@ pub fn print_plan(a: &Answers) {
         ui::dim(&format!("  snapshots       {}", s.label()));
     }
     if let Some(m) = a.target_mode {
-        let v = a.target_version.as_deref().unwrap_or("");
-        ui::dim(&format!("  target cluster  {} {v}", m.label()));
+        ui::dim(&format!("  target          {}", m.label()));
+        if let Some(k) = a.target_kind {
+            let v = a.target_version.as_deref().unwrap_or("");
+            ui::dim(&format!("  target kind     {} {v}", k.label()));
+        }
     }
     if !a.clients.is_empty() {
         let names: Vec<&str> = a.clients.iter().map(|c| c.label()).collect();
@@ -353,8 +418,9 @@ pub fn print_plan(a: &Answers) {
 }
 
 /// Print the resolved endpoints after provisioning (so the operator + MA know
-/// where things live).
-fn print_endpoints(plan: &ProvisionPlan, answers: &Answers) {
+/// where things live). `aoss_endpoint` is the resolved AOSS collection endpoint
+/// when an AOSS NextGen target was provisioned.
+fn print_endpoints(plan: &ProvisionPlan, answers: &Answers, aoss_endpoint: Option<&str>) {
     ui::step("Provisioned endpoints");
     ui::dim(&format!(
         "  source   http://{}:9200  (in-cluster) / http://localhost:19200 (host)",
@@ -363,6 +429,11 @@ fn print_endpoints(plan: &ProvisionPlan, answers: &Answers) {
     if let Some(t) = &plan.target_host {
         ui::dim(&format!(
             "  target   http://{t}:9200  (in-cluster) / http://localhost:29200 (host)"
+        ));
+    }
+    if let Some(ep) = aoss_endpoint {
+        ui::dim(&format!(
+            "  target   {ep}  (AOSS Serverless NextGen, SigV4 'aoss')"
         ));
     }
     if answers.target == Some(crate::model::Target::Cloud) {
@@ -429,6 +500,7 @@ mod tests {
             QuestionId::SourcePlugins => "plugins",
             QuestionId::SnapshotStorage => "snapshot",
             QuestionId::TargetMode => "tmode",
+            QuestionId::TargetKind => "tkind",
             QuestionId::TargetVersion => "tversion",
             QuestionId::Clients => "clients",
             QuestionId::SeedData => "seed",
@@ -623,6 +695,38 @@ mod tests {
         );
         assert_eq!(code, 0);
         assert!(!r.any_call_contains("kind delete"));
+        assert!(!ws.exists());
+    }
+
+    #[test]
+    fn destroy_tears_down_aoss_target_when_planned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        // Persist a plan whose target is AOSS NextGen.
+        let mut st = State::new(&ws);
+        st.plan.answers.target_mode = Some(crate::model::TargetMode::Provision);
+        st.plan.answers.target_kind = Some(crate::model::TargetKind::AossServerlessNextGen);
+        st.save().unwrap();
+
+        let r = MockRunner::new().with_command("kind").with_command("aws").stub(
+            "aws",
+            &["batch-get-collection"],
+            0,
+            r#"{"collectionDetails":[{"status":"ACTIVE","id":"colid123","collectionEndpoint":"https://x.aoss.us-east-1.on.aws"}]}"#,
+        );
+        let w = ScriptWizard::new();
+        let code = dispatch(
+            &args(&["destroy", "--workspace", ws.to_str().unwrap()]),
+            &r,
+            &w,
+        );
+        assert_eq!(code, 0);
+        // Resolved the ID and deleted the collection by ID.
+        assert!(r.any_call_contains("delete-collection --region"));
+        assert!(r.any_call_contains("--id colid123"));
+        // Deleted the policies too.
+        assert!(r.any_call_contains("delete-security-policy"));
+        assert!(r.any_call_contains("delete-access-policy"));
         assert!(!ws.exists());
     }
 
