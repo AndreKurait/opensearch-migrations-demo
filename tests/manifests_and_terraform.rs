@@ -113,10 +113,12 @@ fn cloud_path_emits_reviewable_terraform() {
 }
 
 #[test]
-fn data_seed_job_bulk_loads_the_source() {
+fn data_seed_job_bulk_loads_three_indices() {
     let host = plan::source_service_name(SourceEngine::OpenSearch);
     let y = manifests::data_seed_job(host);
-    // Self-contained curl bulk loader against the source's _bulk API.
+    // Self-contained curl bulk loader; creates + loads all SEED_INDICES.
     assert!(y.contains("curlimages/curl:8.10.1"));
-    assert!(y.contains(&format!("http://{host}:9200/demo-logs/_bulk")));
+    for idx in manifests::SEED_INDICES {
+        assert!(y.contains(&format!("http://{host}:9200/{idx}/_bulk")));
+    }
 }

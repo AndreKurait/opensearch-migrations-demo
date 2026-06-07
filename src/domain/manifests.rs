@@ -457,21 +457,7 @@ pub fn sample_search_app(source_host: &str) -> String {
 /// free (no DataGenerator/console image, which needs a migration config) — the
 /// goal is simply visible, migratable data on the source.
 pub fn data_seed_job(source_host: &str) -> String {
-    // Wait for the source, then generate ~300 bulk docs with a tiny awk loop and
-    // POST them. ES and OpenSearch share the `_bulk` newline-delimited format.
-    let script = format!(
-        "echo 'waiting for {source_host}…'; \
-         until curl -sf http://{source_host}:9200 >/dev/null 2>&1; do sleep 3; done; \
-         echo 'source up; seeding demo-logs'; \
-         awk 'BEGIN{{for(i=0;i<300;i++){{\
-print \"{{\\\"index\\\":{{}}}}\"; \
-print \"{{\\\"user\\\":\" (i%100) \",\\\"msg\\\":\\\"demo log line \" i \"\\\",\\\"level\\\":\\\"info\\\"}}\"}}}}' > /tmp/bulk.ndjson; \
-         curl -s -H 'Content-Type: application/x-ndjson' \
-           -XPOST 'http://{source_host}:9200/demo-logs/_bulk?refresh=true' \
-           --data-binary @/tmp/bulk.ndjson > /tmp/out.json; \
-         echo 'seeded; doc count:'; \
-         curl -s 'http://{source_host}:9200/demo-logs/_count'"
-    );
+    let script = data_seed_script(source_host);
     format!(
         "apiVersion: batch/v1\n\
          kind: Job\n\
@@ -488,6 +474,54 @@ print \"{{\\\"user\\\":\" (i%100) \",\\\"msg\\\":\\\"demo log line \" i \"\\\",\
          \x20         image: curlimages/curl:8.10.1\n\
          \x20         command: [\"sh\", \"-c\", {}]\n",
         yaml_quote(&script)
+    )
+}
+
+/// The indices the seed Job creates, so the migration has a varied, realistic
+/// payload to move (each with a distinct mapping shape).
+pub const SEED_INDICES: [&str; 3] = ["demo-logs", "demo-users", "demo-products"];
+
+/// The shell script the seed Job runs: wait for the source, create three
+/// indices with explicit mappings, bulk-load realistic docs into each, then
+/// print per-index counts. ES and OpenSearch share the `_bulk` NDJSON format,
+/// so one script covers both. Dependency-free (curl + awk in the curl image).
+fn data_seed_script(host: &str) -> String {
+    let base = format!("http://{host}:9200");
+    // Per-index explicit mappings (exercise text/keyword/integer/date/float
+    // mapping migration), then a bulk loader for each.
+    format!(
+        "set -e; \
+         echo 'waiting for {host}…'; \
+         until curl -sf {base} >/dev/null 2>&1; do sleep 3; done; \
+         echo 'source up; creating indices + seeding'; \
+         \
+         curl -s -XPUT '{base}/demo-logs' -H 'Content-Type: application/json' -d \
+         '{{\"mappings\":{{\"properties\":{{\"user\":{{\"type\":\"integer\"}},\"msg\":{{\"type\":\"text\"}},\"level\":{{\"type\":\"keyword\"}},\"ts\":{{\"type\":\"date\"}}}}}}}}' >/dev/null; \
+         curl -s -XPUT '{base}/demo-users' -H 'Content-Type: application/json' -d \
+         '{{\"mappings\":{{\"properties\":{{\"name\":{{\"type\":\"keyword\"}},\"email\":{{\"type\":\"keyword\"}},\"age\":{{\"type\":\"integer\"}},\"active\":{{\"type\":\"boolean\"}}}}}}}}' >/dev/null; \
+         curl -s -XPUT '{base}/demo-products' -H 'Content-Type: application/json' -d \
+         '{{\"mappings\":{{\"properties\":{{\"sku\":{{\"type\":\"keyword\"}},\"title\":{{\"type\":\"text\"}},\"price\":{{\"type\":\"float\"}},\"in_stock\":{{\"type\":\"boolean\"}}}}}}}}' >/dev/null; \
+         \
+         awk 'BEGIN{{lvl[0]=\"info\";lvl[1]=\"warn\";lvl[2]=\"error\";for(i=0;i<500;i++){{\
+print \"{{\\\"index\\\":{{}}}}\"; \
+print \"{{\\\"user\\\":\" (i%100) \",\\\"msg\\\":\\\"demo log line \" i \"\\\",\\\"level\\\":\\\"\" lvl[i%3] \"\\\",\\\"ts\\\":\\\"2026-06-07T00:00:00Z\\\"}}\"}}}}' > /tmp/logs.ndjson; \
+         curl -s -H 'Content-Type: application/x-ndjson' -XPOST '{base}/demo-logs/_bulk' --data-binary @/tmp/logs.ndjson >/dev/null; \
+         \
+         awk 'BEGIN{{for(i=0;i<200;i++){{\
+print \"{{\\\"index\\\":{{}}}}\"; \
+print \"{{\\\"name\\\":\\\"user\" i \"\\\",\\\"email\\\":\\\"user\" i \"@example.com\\\",\\\"age\\\":\" (18+i%60) \",\\\"active\\\":\" (i%2==0?\"true\":\"false\") \"}}\"}}}}' > /tmp/users.ndjson; \
+         curl -s -H 'Content-Type: application/x-ndjson' -XPOST '{base}/demo-users/_bulk' --data-binary @/tmp/users.ndjson >/dev/null; \
+         \
+         awk 'BEGIN{{for(i=0;i<150;i++){{\
+print \"{{\\\"index\\\":{{}}}}\"; \
+print \"{{\\\"sku\\\":\\\"SKU-\" i \"\\\",\\\"title\\\":\\\"product \" i \"\\\",\\\"price\\\":\" (i%100) \".99,\\\"in_stock\\\":\" (i%3!=0?\"true\":\"false\") \"}}\"}}}}' > /tmp/products.ndjson; \
+         curl -s -H 'Content-Type: application/x-ndjson' -XPOST '{base}/demo-products/_bulk' --data-binary @/tmp/products.ndjson >/dev/null; \
+         \
+         curl -s -XPOST '{base}/_refresh' >/dev/null; \
+         echo 'seeded. counts:'; \
+         for idx in demo-logs demo-users demo-products; do \
+           printf '  %s: ' \"$idx\"; curl -s \"{base}/$idx/_count\" | sed 's/.*\"count\":\\([0-9]*\\).*/\\1/'; echo; \
+         done"
     )
 }
 
@@ -635,13 +669,26 @@ mod tests {
     }
 
     #[test]
-    fn data_seed_job_bulk_loads_source_over_rest() {
+    fn data_seed_job_bulk_loads_three_indices_over_rest() {
         let y = data_seed_job("source-elasticsearch");
-        // Self-contained curl-based bulk loader (no console image, which needs a
-        // migration config). Waits for the source, then _bulk-loads demo-logs.
+        // Self-contained curl-based loader: creates + bulk-loads three indices
+        // with distinct mappings, then prints counts.
         assert!(y.contains("curlimages/curl:8.10.1"));
-        assert!(y.contains("http://source-elasticsearch:9200/demo-logs/_bulk"));
         assert!(y.contains("kind: Job"));
+        for idx in SEED_INDICES {
+            assert!(
+                y.contains(&format!("http://source-elasticsearch:9200/{idx}/_bulk")),
+                "seed should bulk-load {idx}"
+            );
+            assert!(
+                y.contains(&format!("PUT 'http://source-elasticsearch:9200/{idx}'")),
+                "seed should create {idx} with an explicit mapping"
+            );
+        }
+        // Exercises varied mapping types across the indices.
+        assert!(y.contains("\\\"type\\\":\\\"date\\\""));
+        assert!(y.contains("\\\"type\\\":\\\"float\\\""));
+        assert!(y.contains("\\\"type\\\":\\\"boolean\\\""));
     }
 
     #[test]

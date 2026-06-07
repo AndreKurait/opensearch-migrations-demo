@@ -4,6 +4,13 @@ An interactive **TUI** that stands up a complete, throwaway test environment for
 the [OpenSearch **Migration Assistant**](https://github.com/opensearch-project/opensearch-migrations),
 then hands you off to the Migration Assistant CLI to run the actual migration.
 
+![ma-demo wizard walkthrough](docs/demo.gif)
+
+> The wizard above is the real `ma-demo` binary in `plan` mode (no resources
+> created). It walks every question — source engine + version + plugins,
+> snapshot storage, target kind, client apps, sample-data seeding, and the
+> Migration Assistant handoff — then prints the plan it would provision.
+
 It asks you a short series of questions — *local or cloud? which source engine
 and version? which plugins? snapshot storage? a target cluster? which client
 apps?* — and from your answers it provisions everything, end to end:
@@ -172,6 +179,16 @@ src/
   command/   app (provisioning orchestrator) · cli (dispatcher)
 tests/       provision_pipeline · cli_dispatch · manifests_and_terraform
 terraform/   standalone AWS examples (aws-source / aws-target)
+docs/        demo.tape (VHS script) · demo.gif (the README recording)
+```
+
+### Regenerating the demo GIF
+
+The README recording is scripted with [VHS](https://github.com/charmbracelet/vhs):
+
+```sh
+cargo build --release          # docs/demo.tape drives ./target/release/ma-demo
+vhs docs/demo.tape             # → docs/demo.gif
 ```
 
 ## License
