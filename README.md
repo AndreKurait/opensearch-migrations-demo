@@ -22,27 +22,31 @@ stays up until you quit (or open it any time with `ma-demo status`):
 > in place as the dashboard re-probes.
 
 **Before anything is provisioned**, the harness always shows an editable
-**review screen** of the whole plan — move to any field and edit it, or cancel.
-This runs on *every* interactive run, including a resume from a saved plan, so a
-fully-answered plan never silently deploys (especially important for the cloud /
-real-AWS path). `-y` auto-confirms for unattended runs.
+**review screen** — the single front door for an interactive run. It carries a
+context header (the harness version, the workspace, the AWS account/profile/
+region you're about to deploy into, and a newer-release upgrade hint if one
+exists) above the whole editable plan — move to any field and edit it, confirm,
+or cancel. There are no bash-style printed lines before it. This runs on *every*
+interactive run, including a resume from a saved plan, so a fully-answered plan
+never silently deploys (especially important for the cloud / real-AWS path).
+`-y` auto-confirms for unattended runs (which print the same context to stdout,
+since there's no TTY). Press `Ctrl-C` (or `q`/`Esc`) to cancel any screen.
 
-On startup it also checks GitHub for a newer release and, if one exists, prints
-a one-line upgrade hint (fail-silent — never blocks; opt out with
-`MA_DEMO_NO_UPDATE_CHECK=1`).
+The startup release check is fail-silent — never blocks; opt out with
+`MA_DEMO_NO_UPDATE_CHECK=1`.
 
 It asks you a short series of questions — *local or cloud? which source engine
 and version? which plugins? snapshot storage? a target cluster? which client
 apps?* — and from your answers it provisions everything, end to end:
 
 ```
-local (KIND)                                   cloud (Terraform, emitted only)
-────────────                                   ───────────────────────────────
-ma-demo-source  KIND cluster                   aws_instance.source  (Dockerized ES/OS/Solr)
-  ├─ Elasticsearch / OpenSearch / Solr         aws_s3_bucket.snapshots
-  ├─ requested engine plugins                  aws_opensearch_domain.target
-  ├─ LocalStack S3 (simulated snapshots)
-  ├─ Locust load generator
+local (KIND)                                   cloud (Terraform, applied)
+────────────                                   ──────────────────────────
+ma-demo-source  KIND cluster                   aws_instance.source  (Dockerized ES/OS/Solr,
+  ├─ Elasticsearch / OpenSearch / Solr           private VPC + NAT — no public IP)
+  ├─ requested engine plugins                  aws_s3_bucket.snapshots
+  ├─ LocalStack S3 (simulated snapshots)       AOSS NextGen collection  (serverless target)
+  ├─ Locust load generator                       or aws_opensearch_domain.target
   ├─ sample search application
   └─ DataGenerator seed Job
 ma-demo-target  KIND cluster (optional)
@@ -162,15 +166,17 @@ operator and the Migration Assistant can reach them. Source workloads (the
 search engine, LocalStack, Locust, the sample app, the DataGenerator Job) all
 live in the `ma-demo` namespace of the source cluster.
 
-## How the cloud path works (Terraform, emitted only)
+## How the cloud path works (Terraform, applied)
 
-Choosing **Cloud** writes a reviewable Terraform module under
-`terraform/` — provider + variables, a Dockerized source instance (ES/OS/Solr
-have no managed AWS equivalent, so the source is modeled as an EC2 instance for
-engine fidelity), an S3 snapshot bucket, and a managed Amazon OpenSearch Service
-target domain. **The harness writes the Terraform but does not apply it** — you
-review it and run `terraform init && terraform apply` yourself. See
-[`terraform/README.md`](terraform/README.md).
+Choosing **Cloud** writes a Terraform module under `terraform/` — provider +
+variables, a Dockerized source instance (ES/OS/Solr have no managed AWS
+equivalent, so the source is modeled as an EC2 instance for engine fidelity, in
+a **dedicated private VPC behind a NAT gateway — it never gets a public IP**), an
+S3 snapshot bucket, and the target (an **AOSS NextGen** serverless collection or
+a managed Amazon OpenSearch Service domain). After you **confirm at the review
+screen**, the harness runs `terraform init && terraform apply` for you, streaming
+the live output to the terminal. Pass `--no-apply` to emit the files only and
+apply them yourself. See [`terraform/README.md`](terraform/README.md).
 
 ## The handoff
 

@@ -6,7 +6,7 @@
 use ma_demo::cli::{self, Wizardish};
 use ma_demo::error::{Error, Result};
 use ma_demo::runner::MockRunner;
-use ma_demo::tui::{Outcome, ReviewOutcome};
+use ma_demo::tui::{Outcome, ReviewContext, ReviewOutcome};
 use ma_demo::wizard::{self, Answer, QuestionId, ReviewRow};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -65,7 +65,7 @@ impl Wizardish for Script {
             .cloned()
             .ok_or_else(|| Error::die(format!("no scripted answer for {:?}", question.id)))
     }
-    fn review(&self, _rows: &[ReviewRow]) -> Result<ReviewOutcome> {
+    fn review(&self, _rows: &[ReviewRow], _context: &ReviewContext) -> Result<ReviewOutcome> {
         let mut q = self.review.borrow_mut();
         if q.is_empty() {
             Ok(ReviewOutcome::Confirm)

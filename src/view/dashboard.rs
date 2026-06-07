@@ -235,7 +235,10 @@ fn probe_cloud<R: CommandRunner>(runner: &R, answers: &Answers, tick: u64) -> Sn
         tick,
         ..Default::default()
     };
-    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| plan::AOSS_REGION.to_string());
+    // The saved plan is the single source of truth for profile + region, so
+    // `ma-demo status` probes the same account/region the plan deployed into
+    // regardless of the ambient AWS_* env.
+    let region = answers.effective_aws_region().to_string();
     let profile = answers.effective_aws_profile().to_string();
 
     // ---- account context (replaces the KIND-clusters panel) ----
@@ -581,8 +584,9 @@ fn opensearch_domain_status<R: CommandRunner>(
 
 /// AOSS collection status row (ACTIVE + endpoint, via batch-get-collection).
 fn aoss_status<R: CommandRunner>(runner: &R, answers: &Answers) -> Row {
-    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| plan::AOSS_REGION.to_string());
-    let args = plan::aoss_batch_get_args(&answers.aoss_collection_name(), &region);
+    // Region from the saved plan (single source of truth), not the ambient env.
+    let region = answers.effective_aws_region();
+    let args = plan::aoss_batch_get_args(&answers.aoss_collection_name(), region);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = runner.run("aws", &argv);
     if !out.success() {
@@ -751,8 +755,10 @@ fn truncate(s: &str, max: usize) -> String {
 // Interactive loop — re-probe on a tick, redraw, stay up until the user quits.
 // ---------------------------------------------------------------------------
 
-/// Whether a key should quit the dashboard (q / Esc / Ctrl-C). Pure, so the
-/// binding is tested without a terminal.
+/// Whether a key should quit the dashboard (q / Esc). Pure, so the binding is
+/// tested without a terminal. Ctrl-C also quits, but — because raw mode does not
+/// deliver it as SIGINT — it's matched on the full key event in the loop via
+/// [`crate::view::tui::is_ctrl_c`], not here (this takes only the keycode).
 pub fn key_quits(code: ratatui::crossterm::event::KeyCode) -> bool {
     use ratatui::crossterm::event::KeyCode::*;
     matches!(code, Char('q') | Char('Q') | Esc)
@@ -793,7 +799,7 @@ fn run_loop<R: CommandRunner>(
         // quitting is snappy, independent of the (slower) resource re-probe.
         if event::poll(spin)? {
             if let Event::Key(key) = event::read()? {
-                if key.is_press() && key_quits(key.code) {
+                if key.is_press() && (key_quits(key.code) || crate::view::tui::is_ctrl_c(&key)) {
                     return Ok(());
                 }
             }

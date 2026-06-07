@@ -390,21 +390,22 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
                  Install Terraform, or re-run with --no-apply to emit the files only.",
             ));
         }
+        // init + apply stream their output live to the terminal (run_streaming):
+        // apply can take minutes, and a captured run would look frozen. Their
+        // output isn't parsed — only the exit status matters — and on failure
+        // the error has already scrolled past, so the messages don't echo stderr.
         self.progress.step("terraform init");
-        let init = self.runner.run(
+        let init = self.runner.run_streaming(
             "terraform",
             &[&format!("-chdir={tf_dir_str}"), "init", "-input=false"],
         );
         if !init.success() {
-            return Err(Error::die(format!(
-                "terraform init failed: {}",
-                init.stderr.trim()
-            )));
+            return Err(Error::die("terraform init failed (see the output above)."));
         }
         self.progress
             .step("terraform apply (cloud — this provisions real AWS resources)");
         let region = answers.effective_aws_region().to_string();
-        let apply = self.runner.run(
+        let apply = self.runner.run_streaming(
             "terraform",
             &[
                 &format!("-chdir={tf_dir_str}"),
@@ -416,10 +417,7 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
             ],
         );
         if !apply.success() {
-            return Err(Error::die(format!(
-                "terraform apply failed: {}",
-                apply.stderr.trim()
-            )));
+            return Err(Error::die("terraform apply failed (see the output above)."));
         }
         self.state.advance(Step::TargetUp);
         self.state.save()?;

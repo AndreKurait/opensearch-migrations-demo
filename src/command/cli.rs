@@ -12,7 +12,7 @@ use crate::model::Answers;
 use crate::plan::ProvisionPlan;
 use crate::runner::CommandRunner;
 use crate::state::State;
-use crate::tui::{Outcome, ReviewOutcome};
+use crate::tui::{Outcome, ReviewContext, ReviewOutcome};
 use crate::wizard::{self, QuestionId};
 use crate::{dashboard, terraform, ui};
 use std::path::PathBuf;
@@ -30,9 +30,10 @@ pub trait Wizardish {
     /// multi-choice (resume).
     fn ask(&self, question: &wizard::Question, preselect: &[String]) -> Result<Outcome>;
 
-    /// Present the editable review of the plan and return the operator's choice
-    /// (confirm / edit a field / cancel).
-    fn review(&self, rows: &[wizard::ReviewRow]) -> Result<ReviewOutcome>;
+    /// Present the editable review of the plan — with the contextual header
+    /// (version, workspace, AWS identity, upgrade hint) — and return the
+    /// operator's choice (confirm / edit a field / cancel).
+    fn review(&self, rows: &[wizard::ReviewRow], context: &ReviewContext) -> Result<ReviewOutcome>;
 }
 
 /// The interactive Ratatui wizard.
@@ -41,8 +42,8 @@ impl Wizardish for TuiWizard {
     fn ask(&self, question: &wizard::Question, preselect: &[String]) -> Result<Outcome> {
         crate::tui::run(question.clone(), preselect).map_err(Error::from)
     }
-    fn review(&self, rows: &[wizard::ReviewRow]) -> Result<ReviewOutcome> {
-        crate::tui::run_review(rows.to_vec()).map_err(Error::from)
+    fn review(&self, rows: &[wizard::ReviewRow], context: &ReviewContext) -> Result<ReviewOutcome> {
+        crate::tui::run_review(rows.to_vec(), context.clone()).map_err(Error::from)
     }
 }
 
@@ -120,12 +121,48 @@ pub fn parse_flags(args: &[String]) -> Flags {
     f
 }
 
-/// Run the fail-silent startup update check and, if a newer release is
-/// published, print an upgrade prompt. Never errors or blocks (bounded curl,
-/// degrades to silence offline / opted out / in tests).
-fn check_for_update<R: CommandRunner>(runner: &R) {
-    if let crate::update::Update::Available { latest } = crate::update::check(runner, VERSION) {
-        ui::warn(&crate::update::upgrade_hint(&latest, VERSION));
+/// Run the fail-silent startup update check and return an upgrade hint if a
+/// newer release is published. Never errors or blocks (bounded curl, degrades to
+/// `None` offline / opted out / in tests).
+fn update_hint<R: CommandRunner>(runner: &R) -> Option<String> {
+    match crate::update::check(runner, VERSION) {
+        crate::update::Update::Available { latest } => {
+            Some(crate::update::upgrade_hint(&latest, VERSION))
+        }
+        _ => None,
+    }
+}
+
+/// Resolve the AWS-identity header lines for a plan that touches AWS: the
+/// account/profile/region summary plus the caller ARN (or a creds-expired
+/// warning). Returns `(lines, warning)` where `warning` is true when creds are
+/// missing/expired. Exports the AWS env first so the identity probe + any later
+/// AWS calls share the same profile/region. Empty when the plan is AWS-free.
+fn aws_identity_lines<R: CommandRunner>(runner: &R, answers: &Answers) -> (Vec<String>, bool) {
+    if !answers.touches_aws() {
+        return (Vec::new(), false);
+    }
+    crate::app::export_aws_env(answers);
+    let profile = answers.effective_aws_profile();
+    let region = answers.effective_aws_region();
+    let summary = format!("AWS profile={profile}  region={region}");
+    match crate::aws::caller_identity(runner, profile, region) {
+        Some(arn) => {
+            let acct = crate::aws::account_of(&arn).unwrap_or_else(|| "?".into());
+            (
+                vec![summary, format!("identity {arn}  (account {acct})")],
+                false,
+            )
+        }
+        None => (
+            vec![
+                summary,
+                "AWS credentials for that profile are missing or expired — refresh them \
+                 (e.g. `aws sso login` / `ada credentials update`) before applying."
+                    .to_string(),
+            ],
+            true,
+        ),
     }
 }
 
@@ -189,9 +226,11 @@ fn split_subcommand(args: &[String]) -> (Option<String>, Vec<String>) {
     (Some(args[0].clone()), args[1..].to_vec())
 }
 
-/// The main run path: collect answers, provision, then install + launch the MA
-/// CLI. With `--dry-run` (or the `plan` subcommand, via `force_dry`) it stops
-/// after printing the plan, provisioning nothing.
+/// The main run path: collect answers, present the review TUI front door (the
+/// version/workspace/AWS-identity header + the editable plan), provision on
+/// confirm, then install + launch the MA CLI. With `--dry-run` (or the `plan`
+/// subcommand, via `force_dry`) it stops after printing the plan, provisioning
+/// nothing. Non-interactive (`-y`) skips the TUI and prints the same context.
 fn cmd_run<R: CommandRunner, W: Wizardish>(
     runner: &R,
     wiz: &W,
@@ -206,14 +245,9 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
         .map(PathBuf::from)
         .unwrap_or_else(default_workspace);
 
-    ui::banner("Migration Assistant — Demo Environment Setup");
-    ui::dim(&format!(
-        "  version={VERSION}  workspace={}",
-        workspace.display()
-    ));
-
-    // Fail-silent: prompt to upgrade if a newer release is published on GitHub.
-    check_for_update(runner);
+    // Fail-silent: a hint if a newer release is published on GitHub. Computed
+    // once — shown in the review TUI header (interactive) or printed (CI).
+    let update_hint = update_hint(runner);
 
     // Load any saved plan (resume), then collect remaining answers.
     let mut state = State::new(&workspace);
@@ -239,47 +273,47 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
     state.plan.answers = answers.clone();
     state.save()?;
 
-    // Surface the AWS identity the operator is about to deploy into, when the
-    // plan touches AWS — so they can confirm the profile/region/account.
-    if answers.touches_aws() {
-        crate::app::export_aws_env(&answers);
+    // Two front doors:
+    //   • Interactive — the review TUI is the WHOLE front door. It carries the
+    //     version/workspace/AWS-identity/upgrade header AND the editable plan, so
+    //     there are no bash-style printed lines before it. Shown EVERY run
+    //     (including a resume), so a saved plan never auto-proceeds.
+    //   • Non-interactive / dry-run — there's no TUI, so print the same context
+    //     (banner, version, upgrade hint, AWS identity, plan) to stdout.
+    if flags.non_interactive || flags.dry_run {
+        ui::banner("Migration Assistant — Demo Environment Setup");
         ui::dim(&format!(
-            "  AWS profile={} region={}",
-            answers.effective_aws_profile(),
-            answers.effective_aws_region()
+            "  version={VERSION}  workspace={}",
+            workspace.display()
         ));
-        match crate::aws::caller_identity(
-            runner,
-            answers.effective_aws_profile(),
-            answers.effective_aws_region(),
-        ) {
-            Some(arn) => {
-                let acct = crate::aws::account_of(&arn).unwrap_or_else(|| "?".into());
-                ui::dim(&format!("  AWS identity: {arn}  (account {acct})"));
-            }
-            None => ui::warn(
-                "AWS credentials for that profile are missing or expired — \
-                 refresh them (e.g. `aws sso login` / `ada credentials update`) before applying.",
-            ),
+        if let Some(h) = &update_hint {
+            ui::warn(h);
         }
-    }
-
-    ui::step("Plan");
-    print_plan(&answers);
-
-    if flags.dry_run {
-        ui::ok("dry run — no resources created");
-        return Ok(());
-    }
-
-    // Review-and-edit gate (interactive only). Shown EVERY run — including a
-    // resume from a saved plan — so a fully-answered plan never auto-proceeds to
-    // provisioning. The operator can edit any field or cancel. `-y` auto-confirms.
-    if !flags.non_interactive {
-        match review_and_edit(wiz, &mut answers)? {
+        let (lines, warn) = aws_identity_lines(runner, &answers);
+        for (i, l) in lines.iter().enumerate() {
+            if i == 0 && warn {
+                ui::warn(l);
+            } else {
+                ui::dim(&format!("  {l}"));
+            }
+        }
+        ui::step("Plan");
+        print_plan(&answers);
+        if flags.dry_run {
+            ui::ok("dry run — no resources created");
+            return Ok(());
+        }
+    } else {
+        match review_and_edit(
+            runner,
+            wiz,
+            &mut answers,
+            &workspace,
+            update_hint.as_deref(),
+        )? {
             ReviewDecision::Confirm => {
-                // Re-apply flag overrides + persist any edits, then re-derive the
-                // AWS env in case the profile/region changed during review.
+                // Persist any edits, then re-derive the AWS env in case the
+                // profile/region changed during review.
                 state.plan.answers = answers.clone();
                 state.save()?;
                 if answers.touches_aws() {
@@ -404,14 +438,32 @@ pub enum ReviewDecision {
 }
 
 /// Show the editable review of the plan and let the operator edit any field
-/// until they confirm or cancel. Runs every interactive run (including resume),
-/// so a fully-answered/saved plan never silently proceeds to provisioning.
-/// Editing a field re-asks its question via `wiz` and re-derives downstream
-/// answers (so e.g. switching the source engine re-prompts for version).
-fn review_and_edit<W: Wizardish>(wiz: &W, answers: &mut Answers) -> Result<ReviewDecision> {
+/// until they confirm or cancel. This is the interactive front door: the review
+/// TUI carries a header (version/workspace, the AWS identity being deployed
+/// into, an upgrade hint) plus the editable plan, so there are no printed lines
+/// before it. Runs every interactive run (including resume), so a fully-answered
+/// /saved plan never silently proceeds to provisioning. Editing a field re-asks
+/// its question via `wiz` and re-derives downstream answers (so e.g. switching
+/// the source engine re-prompts for version); the AWS identity in the header is
+/// re-probed each loop, so editing the profile/region updates it in place.
+fn review_and_edit<R: CommandRunner, W: Wizardish>(
+    runner: &R,
+    wiz: &W,
+    answers: &mut Answers,
+    workspace: &std::path::Path,
+    update_hint: Option<&str>,
+) -> Result<ReviewDecision> {
     loop {
+        let (aws, aws_warning) = aws_identity_lines(runner, answers);
+        let context = ReviewContext {
+            version: VERSION.to_string(),
+            workspace: workspace.display().to_string(),
+            aws,
+            aws_warning,
+            update_hint: update_hint.map(str::to_string),
+        };
         let rows = wizard::review_rows(answers);
-        match wiz.review(&rows)? {
+        match wiz.review(&rows, &context)? {
             ReviewOutcome::Confirm => return Ok(ReviewDecision::Confirm),
             ReviewOutcome::Cancel => return Ok(ReviewDecision::Cancel),
             ReviewOutcome::Edit(qid) => {
@@ -747,7 +799,11 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| Error::die(format!("no scripted answer for {:?}", question.id)))
         }
-        fn review(&self, _rows: &[wizard::ReviewRow]) -> Result<ReviewOutcome> {
+        fn review(
+            &self,
+            _rows: &[wizard::ReviewRow],
+            _context: &ReviewContext,
+        ) -> Result<ReviewOutcome> {
             self.reviewed.set(self.reviewed.get() + 1);
             let mut q = self.review.borrow_mut();
             if q.is_empty() {

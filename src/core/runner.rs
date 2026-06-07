@@ -44,6 +44,17 @@ pub trait CommandRunner: Send + Sync {
     /// — they return [`Output`] with the real status, and callers decide.
     fn run(&self, program: &str, args: &[&str]) -> Output;
 
+    /// Run `program` while streaming its stdout/stderr straight to the terminal
+    /// (inherited), rather than capturing it. For long-running, user-facing
+    /// commands whose output we don't parse — e.g. `terraform apply`, which can
+    /// take minutes — so the operator sees live progress instead of a frozen
+    /// line. The returned [`Output`] carries the real exit status but EMPTY
+    /// stdout/stderr (it went to the terminal). The default impl falls back to
+    /// the capturing [`run`](Self::run), so mocks/tests need no extra wiring.
+    fn run_streaming(&self, program: &str, args: &[&str]) -> Output {
+        self.run(program, args)
+    }
+
     /// Whether `program` resolves on PATH — `command -v` / `optional_cmd`.
     fn has_command(&self, program: &str) -> bool;
 
@@ -67,6 +78,23 @@ impl CommandRunner for RealRunner {
             },
             Err(e) => Output {
                 // 127 mirrors the shell "command not found" exit code.
+                status: 127,
+                stdout: String::new(),
+                stderr: format!("failed to spawn {program}: {e}"),
+            },
+        }
+    }
+
+    fn run_streaming(&self, program: &str, args: &[&str]) -> Output {
+        // Inherit the parent's stdio so the child's output streams live to the
+        // terminal. We don't capture it — only the exit status matters here.
+        match std::process::Command::new(program).args(args).status() {
+            Ok(status) => Output {
+                status: status.code().unwrap_or(-1),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            Err(e) => Output {
                 status: 127,
                 stdout: String::new(),
                 stderr: format!("failed to spawn {program}: {e}"),
@@ -309,6 +337,16 @@ mod tests {
     fn mock_default_status_when_no_stub() {
         let r = MockRunner::new().default_status(1);
         assert_eq!(r.run("docker", &["whatever"]).status, 1);
+    }
+
+    #[test]
+    fn run_streaming_default_delegates_to_run_and_records() {
+        // The default run_streaming impl falls back to run, so mocks honor
+        // stubs AND record the call (terraform init/apply assertions rely on it).
+        let r = MockRunner::new().stub("terraform", &["apply"], 0, "Apply complete!");
+        let out = r.run_streaming("terraform", &["-chdir=tf", "apply", "-auto-approve"]);
+        assert!(out.success());
+        assert!(r.any_call_contains("terraform -chdir=tf apply"));
     }
 
     #[test]

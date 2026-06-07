@@ -297,6 +297,16 @@ fn option_span(label: &str, on_cursor: bool, checkbox: Option<bool>) -> Span<'st
     Span::from(format!("{caret}{check}{label}"))
 }
 
+/// Whether a key event is Ctrl-C (or Ctrl-D). In the terminal's raw mode the
+/// kernel does NOT translate Ctrl-C into SIGINT — it arrives as a key event
+/// with the CONTROL modifier — so every interactive loop must treat it as a
+/// quit/cancel itself, or Ctrl-C appears to do nothing. Pure, so it's testable.
+pub fn is_ctrl_c(key: &ratatui::crossterm::event::KeyEvent) -> bool {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+}
+
 /// Drive one question interactively to an [`Outcome`]. Sets up the terminal,
 /// runs the draw→input loop, and ALWAYS restores the terminal before returning.
 /// `preselect` seeds multi-choice selections (resume).
@@ -321,7 +331,13 @@ fn run_event_loop(
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.is_press() {
-                    if let Some(msg) = screen.key_to_msg(key.code) {
+                    // Ctrl-C is not SIGINT in raw mode — treat it as Cancel.
+                    let msg = if is_ctrl_c(&key) {
+                        Some(ScreenMsg::Cancel)
+                    } else {
+                        screen.key_to_msg(key.code)
+                    };
+                    if let Some(msg) = msg {
                         screen.update(msg);
                     }
                 }
@@ -360,21 +376,86 @@ pub enum ReviewMsg {
     Cancel,
 }
 
-/// The review model: the rows + the cursor.
+/// The contextual header shown above the plan rows on the review screen — the
+/// information that used to be printed as bash-style lines before the TUI
+/// (version, workspace, the AWS identity being deployed into, and an optional
+/// upgrade hint). Folding it into the review makes the interactive front door a
+/// single cohesive screen. Pure data, so the header is asserted via `TestBackend`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewContext {
+    /// The harness version (e.g. `0.1.2`).
+    pub version: String,
+    /// The workspace directory the run writes into.
+    pub workspace: String,
+    /// AWS identity lines, shown only when the plan touches AWS (account /
+    /// profile / region, and the caller ARN or a creds-expired warning).
+    pub aws: Vec<String>,
+    /// Set when AWS credentials are missing/expired — rendered as a warning so
+    /// the operator fixes them before confirming a cloud deploy.
+    pub aws_warning: bool,
+    /// A one-line "a newer release is available" hint, if the startup check
+    /// found one.
+    pub update_hint: Option<String>,
+}
+
+/// The review model: the rows + the cursor + the contextual header.
 #[derive(Debug, Clone)]
 pub struct ReviewScreen {
     pub rows: Vec<ReviewRow>,
     pub cursor: usize,
     pub outcome: Option<ReviewOutcome>,
+    pub context: ReviewContext,
 }
 
 impl ReviewScreen {
     pub fn new(rows: Vec<ReviewRow>) -> Self {
+        Self::with_context(rows, ReviewContext::default())
+    }
+
+    pub fn with_context(rows: Vec<ReviewRow>, context: ReviewContext) -> Self {
         Self {
             rows,
             cursor: 0,
             outcome: None,
+            context,
         }
+    }
+
+    /// The header lines (version/workspace, AWS identity, upgrade hint) rendered
+    /// above the plan rows. Pure, so the header content is unit-tested.
+    fn header_lines(&self) -> Vec<Line<'static>> {
+        let c = &self.context;
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if !c.version.is_empty() || !c.workspace.is_empty() {
+            lines.push(Line::from(vec![
+                Span::from("ma-demo ").dim(),
+                Span::from(c.version.clone()).bold(),
+                Span::from("  ·  workspace ").dim(),
+                Span::from(c.workspace.clone()).dim(),
+            ]));
+        }
+        for (i, l) in c.aws.iter().enumerate() {
+            let span = Span::from(l.clone());
+            // The first AWS line is the account/profile/region summary; style it
+            // as a warning when creds are missing/expired so it stands out.
+            let span = if i == 0 && c.aws_warning {
+                span.yellow()
+            } else {
+                span.dim()
+            };
+            lines.push(Line::from(span));
+        }
+        if let Some(h) = &c.update_hint {
+            lines.push(Line::from(Span::from(h.clone()).yellow()));
+        }
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(
+            "Nothing is created yet. Review every setting below.".dim(),
+        ));
+        lines.push(Line::from(""));
+        lines
     }
 
     /// Map a key to a [`ReviewMsg`]. Up/down move; Enter/e edits the focused
@@ -419,18 +500,15 @@ impl Widget for &ReviewScreen {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        let header = self.header_lines();
         let [title_a, body_a, hint_a] = Layout::vertical([
-            Constraint::Length(2),
+            Constraint::Length(header.len() as u16),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
         .areas(inner);
 
-        Paragraph::new(vec![
-            Line::from("Nothing is created yet. Review every setting below.".dim()),
-            Line::from("".dim()),
-        ])
-        .render(title_a, buf);
+        Paragraph::new(header).render(title_a, buf);
 
         let lines: Vec<Line> = self
             .rows
@@ -456,10 +534,10 @@ impl Widget for &ReviewScreen {
 }
 
 /// Drive the review screen to a [`ReviewOutcome`]. Sets up + always restores
-/// the terminal.
-pub fn run_review(rows: Vec<ReviewRow>) -> std::io::Result<ReviewOutcome> {
+/// the terminal. `context` renders the version/workspace/AWS-identity header.
+pub fn run_review(rows: Vec<ReviewRow>, context: ReviewContext) -> std::io::Result<ReviewOutcome> {
     let mut terminal = ratatui::try_init()?;
-    let result = run_review_loop(&mut terminal, ReviewScreen::new(rows));
+    let result = run_review_loop(&mut terminal, ReviewScreen::with_context(rows, context));
     ratatui::restore();
     result
 }
@@ -477,7 +555,13 @@ fn run_review_loop(
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.is_press() {
-                    if let Some(msg) = screen.key_to_msg(key.code) {
+                    // Ctrl-C is not SIGINT in raw mode — treat it as Cancel.
+                    let msg = if is_ctrl_c(&key) {
+                        Some(ReviewMsg::Cancel)
+                    } else {
+                        screen.key_to_msg(key.code)
+                    };
+                    if let Some(msg) = msg {
                         screen.update(msg);
                     }
                 }
@@ -613,5 +697,77 @@ mod tests {
         assert!(text.contains("Where should the test environment run"));
         assert!(text.contains("Local"));
         assert!(text.contains("Cloud"));
+    }
+
+    #[test]
+    fn ctrl_c_is_detected_but_a_plain_c_is_not() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let plain_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(is_ctrl_c(&ctrl_c));
+        assert!(is_ctrl_c(&ctrl_d));
+        // A bare `c` is the review's "confirm" — it must NOT be read as Ctrl-C.
+        assert!(!is_ctrl_c(&plain_c));
+    }
+
+    fn review_text(screen: &ReviewScreen, w: u16, h: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| screen.view(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area().height)
+            .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    fn review_rows() -> Vec<ReviewRow> {
+        wizard::review_rows(&Answers::new())
+    }
+
+    #[test]
+    fn review_header_shows_version_workspace_and_aws_identity() {
+        let ctx = ReviewContext {
+            version: "0.1.2".into(),
+            workspace: "/tmp/ws".into(),
+            aws: vec![
+                "AWS profile=default  region=us-east-1".into(),
+                "identity arn:aws:sts::874041194807:assumed-role/Foo/x  (account 874041194807)"
+                    .into(),
+            ],
+            aws_warning: false,
+            update_hint: None,
+        };
+        let screen = ReviewScreen::with_context(review_rows(), ctx);
+        let text = review_text(&screen, 100, 30);
+        assert!(text.contains("0.1.2"), "version in header");
+        assert!(text.contains("/tmp/ws"), "workspace in header");
+        assert!(text.contains("874041194807"), "AWS account in header");
+        assert!(text.contains("Review the plan"), "title bar");
+        // The plan rows still render.
+        assert!(text.contains("Where"));
+    }
+
+    #[test]
+    fn review_header_shows_upgrade_hint_when_present() {
+        let ctx = ReviewContext {
+            version: "0.1.1".into(),
+            workspace: "/tmp/ws".into(),
+            aws: Vec::new(),
+            aws_warning: false,
+            update_hint: Some("A newer ma-demo is available: v0.1.2".into()),
+        };
+        let screen = ReviewScreen::with_context(review_rows(), ctx);
+        let text = review_text(&screen, 100, 30);
+        assert!(text.contains("newer ma-demo is available"));
+    }
+
+    #[test]
+    fn review_without_context_has_no_header_but_still_renders_plan() {
+        let screen = ReviewScreen::new(review_rows());
+        let text = review_text(&screen, 100, 24);
+        assert!(text.contains("Nothing is created yet"));
+        assert!(text.contains("Where"));
     }
 }
