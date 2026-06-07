@@ -1,0 +1,12 @@
+# Pin the Rust toolchain for the migration-assistant-demo harness.
+#
+# rustup honors this file automatically: any `cargo`/`rustc` invocation inside
+# this directory uses the pinned channel, fetching it on first use.
+#
+# Pinned to 1.96.0 — comfortably above every dependency floor (ratatui 0.30
+# needs >=1.88) and matching the migration-assistant CLI this harness drives.
+# Keep in sync with Cargo.toml rust-version.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

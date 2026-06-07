@@ -1,0 +1,68 @@
+# CI for the migration-assistant-demo harness (Rust + Ratatui).
+# The toolchain is pinned in rust-toolchain.toml; rustup fetches it on the first
+# cargo call. Mirrors the migration-assistant CLI's quality bar.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast feedback: format + lints. Fails on any rustfmt diff or clippy warning.
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show && cargo --version && cargo clippy --version && cargo fmt --version
+      - name: rustfmt (check)
+        run: cargo fmt --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Unit + integration suites — the pure wizard/manifest/terraform logic, the
+  # orchestrator vs the mock runner, and the TUI vs TestBackend. No Docker.
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show
+      - name: cargo test
+        run: cargo test --locked
+      - name: build + smoke the binary (version, help, exit codes)
+        run: |
+          set -e
+          DEMO_VERSION=0.1.0-ci cargo build --release --locked
+          BIN=target/release/ma-demo
+          v="$("$BIN" version)"
+          echo "version: $v"
+          echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::version not x.y.z"; exit 1; }
+          "$BIN" help | grep -q 'OpenSearch Migration Assistant demo'
+          # Unknown command must exit 64 (CLI dispatcher contract).
+          rc=0; "$BIN" notacommand >/dev/null 2>&1 || rc=$?
+          [ "$rc" -eq 64 ] || { echo "::error::expected exit 64, got $rc"; exit 1; }
+
+  # The emitted Terraform must stay valid HCL (fmt + validate, no apply).
+  terraform:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+      - name: fmt check
+        run: terraform -chdir=terraform fmt -check -recursive
+      - name: validate aws-source
+        run: |
+          terraform -chdir=terraform/aws-source init -backend=false
+          terraform -chdir=terraform/aws-source validate
+      - name: validate aws-target
+        run: |
+          terraform -chdir=terraform/aws-target init -backend=false
+          terraform -chdir=terraform/aws-target validate

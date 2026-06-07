@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Generated provisioning workspace (the harness writes plans + manifests here).
+/migration-demo-workspace/
+
+# Terraform state (the harness emits .tf; users run it themselves).
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.backup
+**/.terraform.lock.hcl
+
+.DS_Store
