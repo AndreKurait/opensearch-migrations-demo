@@ -21,6 +21,16 @@ stays up until you quit (or open it any time with `ma-demo status`):
 > per-index document counts, the target, and the Migration Assistant all update
 > in place as the dashboard re-probes.
 
+**Before anything is provisioned**, the harness always shows an editable
+**review screen** of the whole plan — move to any field and edit it, or cancel.
+This runs on *every* interactive run, including a resume from a saved plan, so a
+fully-answered plan never silently deploys (especially important for the cloud /
+real-AWS path). `-y` auto-confirms for unattended runs.
+
+On startup it also checks GitHub for a newer release and, if one exists, prints
+a one-line upgrade hint (fail-silent — never blocks; opt out with
+`MA_DEMO_NO_UPDATE_CHECK=1`).
+
 It asks you a short series of questions — *local or cloud? which source engine
 and version? which plugins? snapshot storage? a target cluster? which client
 apps?* — and from your answers it provisions everything, end to end:

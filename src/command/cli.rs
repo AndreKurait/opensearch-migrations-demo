@@ -12,7 +12,7 @@ use crate::model::Answers;
 use crate::plan::ProvisionPlan;
 use crate::runner::CommandRunner;
 use crate::state::State;
-use crate::tui::Outcome;
+use crate::tui::{Outcome, ReviewOutcome};
 use crate::wizard::{self, QuestionId};
 use crate::{dashboard, terraform, ui};
 use std::path::PathBuf;
@@ -29,6 +29,10 @@ pub trait Wizardish {
     /// Present `question`, returning the chosen [`Outcome`]. `preselect` seeds
     /// multi-choice (resume).
     fn ask(&self, question: &wizard::Question, preselect: &[String]) -> Result<Outcome>;
+
+    /// Present the editable review of the plan and return the operator's choice
+    /// (confirm / edit a field / cancel).
+    fn review(&self, rows: &[wizard::ReviewRow]) -> Result<ReviewOutcome>;
 }
 
 /// The interactive Ratatui wizard.
@@ -36,6 +40,9 @@ pub struct TuiWizard;
 impl Wizardish for TuiWizard {
     fn ask(&self, question: &wizard::Question, preselect: &[String]) -> Result<Outcome> {
         crate::tui::run(question.clone(), preselect).map_err(Error::from)
+    }
+    fn review(&self, rows: &[wizard::ReviewRow]) -> Result<ReviewOutcome> {
+        crate::tui::run_review(rows.to_vec()).map_err(Error::from)
     }
 }
 
@@ -111,6 +118,15 @@ pub fn parse_flags(args: &[String]) -> Flags {
         i += 1;
     }
     f
+}
+
+/// Run the fail-silent startup update check and, if a newer release is
+/// published, print an upgrade prompt. Never errors or blocks (bounded curl,
+/// degrades to silence offline / opted out / in tests).
+fn check_for_update<R: CommandRunner>(runner: &R) {
+    if let crate::update::Update::Available { latest } = crate::update::check(runner, VERSION) {
+        ui::warn(&crate::update::upgrade_hint(&latest, VERSION));
+    }
 }
 
 /// The default workspace directory (one removable folder under CWD).
@@ -196,6 +212,9 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
         workspace.display()
     ));
 
+    // Fail-silent: prompt to upgrade if a newer release is published on GitHub.
+    check_for_update(runner);
+
     // Load any saved plan (resume), then collect remaining answers.
     let mut state = State::new(&workspace);
     state.load()?;
@@ -251,6 +270,27 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
     if flags.dry_run {
         ui::ok("dry run — no resources created");
         return Ok(());
+    }
+
+    // Review-and-edit gate (interactive only). Shown EVERY run — including a
+    // resume from a saved plan — so a fully-answered plan never auto-proceeds to
+    // provisioning. The operator can edit any field or cancel. `-y` auto-confirms.
+    if !flags.non_interactive {
+        match review_and_edit(wiz, &mut answers)? {
+            ReviewDecision::Confirm => {
+                // Re-apply flag overrides + persist any edits, then re-derive the
+                // AWS env in case the profile/region changed during review.
+                state.plan.answers = answers.clone();
+                state.save()?;
+                if answers.touches_aws() {
+                    crate::app::export_aws_env(&answers);
+                }
+            }
+            ReviewDecision::Cancel => {
+                ui::info("cancelled — nothing was created.");
+                return Ok(());
+            }
+        }
     }
 
     // Provision through the orchestrator. On the cloud path, apply Terraform
@@ -351,6 +391,44 @@ fn collect_answers<W: Wizardish>(
             }
             Outcome::Cancelled => {
                 return Err(Error::die("setup cancelled by user"));
+            }
+        }
+    }
+}
+
+/// The operator's decision at the review gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Confirm,
+    Cancel,
+}
+
+/// Show the editable review of the plan and let the operator edit any field
+/// until they confirm or cancel. Runs every interactive run (including resume),
+/// so a fully-answered/saved plan never silently proceeds to provisioning.
+/// Editing a field re-asks its question via `wiz` and re-derives downstream
+/// answers (so e.g. switching the source engine re-prompts for version).
+fn review_and_edit<W: Wizardish>(wiz: &W, answers: &mut Answers) -> Result<ReviewDecision> {
+    loop {
+        let rows = wizard::review_rows(answers);
+        match wiz.review(&rows)? {
+            ReviewOutcome::Confirm => return Ok(ReviewDecision::Confirm),
+            ReviewOutcome::Cancel => return Ok(ReviewDecision::Cancel),
+            ReviewOutcome::Edit(qid) => {
+                // Re-ask the chosen question, applying the new answer.
+                let q = wizard::build(qid, answers);
+                let preselect = preselect_for(qid, answers);
+                match wiz.ask(&q, &preselect)? {
+                    Outcome::Answered(ans) => {
+                        wizard::apply(answers, qid, ans);
+                    }
+                    // Cancelling the edit just returns to the review unchanged.
+                    Outcome::Cancelled => {}
+                }
+                // An edit can open a new branch (e.g. switching to a provisioned
+                // target reveals target-kind/version) — fill any newly-required
+                // unanswered fields with defaults so the review stays complete.
+                wizard::fill_defaults(answers);
             }
         }
     }
@@ -592,6 +670,12 @@ Flags:\n\
 \x20 --no-apply                 Cloud path: emit Terraform but don't apply it.\n\
 \x20 --aws-profile NAME         AWS profile for cloud / AOSS operations.\n\
 \x20 --aws-region REGION        AWS region for cloud / AOSS operations.\n\n\
+Env:\n\
+\x20 MA_DEMO_NO_UPDATE_CHECK=1  Skip the startup check for a newer release.\n\n\
+On startup, ma-demo checks GitHub for a newer release and prints an upgrade\n\
+hint if one exists (fail-silent; never blocks). Before provisioning, it always\n\
+shows a review screen of the full plan — edit any field or cancel — so a saved\n\
+plan never auto-deploys.\n\n\
 This harness stands up a SOURCE search cluster (Elasticsearch / OpenSearch /\n\
 Solr), optional snapshot storage + target OpenSearch, and client apps, locally\n\
 via KIND or as Terraform for AWS — then installs and launches the Migration\n\
@@ -609,20 +693,31 @@ mod tests {
     use crate::wizard::Answer;
     use std::cell::RefCell;
 
-    /// A scripted wizard: returns canned outcomes per question id.
+    /// A scripted wizard: returns canned outcomes per question id, and a
+    /// scriptable review outcome (defaults to Confirm). `reviewed` counts how
+    /// many times the review gate was shown.
     struct ScriptWizard {
         answers: std::collections::HashMap<&'static str, Outcome>,
         asked: RefCell<Vec<QuestionId>>,
+        review: RefCell<Vec<ReviewOutcome>>,
+        reviewed: std::cell::Cell<usize>,
     }
     impl ScriptWizard {
         fn new() -> Self {
             Self {
                 answers: Default::default(),
                 asked: RefCell::new(Vec::new()),
+                review: RefCell::new(Vec::new()),
+                reviewed: std::cell::Cell::new(0),
             }
         }
         fn with(mut self, id: QuestionId, out: Outcome) -> Self {
             self.answers.insert(key(id), out);
+            self
+        }
+        /// Queue review outcomes (consumed in order; defaults to Confirm).
+        fn with_review(self, outs: Vec<ReviewOutcome>) -> Self {
+            *self.review.borrow_mut() = outs;
             self
         }
     }
@@ -651,6 +746,15 @@ mod tests {
                 .get(key(question.id))
                 .cloned()
                 .ok_or_else(|| Error::die(format!("no scripted answer for {:?}", question.id)))
+        }
+        fn review(&self, _rows: &[wizard::ReviewRow]) -> Result<ReviewOutcome> {
+            self.reviewed.set(self.reviewed.get() + 1);
+            let mut q = self.review.borrow_mut();
+            if q.is_empty() {
+                Ok(ReviewOutcome::Confirm)
+            } else {
+                Ok(q.remove(0))
+            }
         }
     }
 
@@ -776,6 +880,96 @@ mod tests {
         assert!(asked.contains(&QuestionId::MaHandoff));
     }
 
+    /// A saved/complete plan must STILL show the review gate (the footgun fix)
+    /// — it must not silently proceed to provisioning. Cancelling at the review
+    /// aborts with nothing created.
+    #[test]
+    fn saved_plan_shows_review_and_cancel_provisions_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        // Pre-seed a fully-answered cloud/AOSS plan (the dangerous case).
+        let mut st = State::new(&ws);
+        let mut a = Answers::new();
+        a.target = Some(crate::model::Target::Cloud);
+        a.source_engine = Some(crate::model::SourceEngine::Solr);
+        a.source_version = Some("8.11.3".into());
+        a.plugins_done = true;
+        a.snapshot_storage = Some(crate::model::SnapshotStorage::AwsS3);
+        a.target_mode = Some(crate::model::TargetMode::Provision);
+        a.target_kind = Some(crate::model::TargetKind::AossServerlessNextGen);
+        a.aws_profile = Some("default".into());
+        a.aws_region = Some("us-east-1".into());
+        a.clients_done = true;
+        a.seed_data = Some(true);
+        a.ma_handoff = Some(crate::model::MaHandoff::InstallCli);
+        st.plan.answers = a;
+        st.save().unwrap();
+
+        let r = ready_runner().with_command("terraform");
+        // The wizard asks nothing (all answered); the review is shown → Cancel.
+        let w = ScriptWizard::new().with_review(vec![ReviewOutcome::Cancel]);
+        let code = dispatch(&args(&["run", "--workspace", ws.to_str().unwrap()]), &r, &w);
+        assert_eq!(code, 0);
+        // The review WAS shown (footgun fix), and nothing was provisioned.
+        assert_eq!(w.reviewed.get(), 1, "review gate must run for a saved plan");
+        assert!(!r.any_call_contains("terraform"));
+        assert!(
+            w.asked.borrow().is_empty(),
+            "no questions re-asked for a complete plan"
+        );
+    }
+
+    /// Editing a field at the review re-asks that question, then re-shows the
+    /// review; confirming then proceeds with the edited value.
+    #[test]
+    fn review_edit_reasks_then_confirms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut st = State::new(&ws);
+        let mut a = Answers::new();
+        a.target = Some(crate::model::Target::Local);
+        a.source_engine = Some(crate::model::SourceEngine::Elasticsearch);
+        a.source_version = Some("8.17.0".into());
+        a.plugins_done = true;
+        a.snapshot_storage = Some(crate::model::SnapshotStorage::None);
+        a.target_mode = Some(crate::model::TargetMode::LeaveToMa);
+        a.clients_done = true;
+        a.seed_data = Some(false);
+        a.ma_handoff = Some(crate::model::MaHandoff::InstallCli);
+        st.plan.answers = a;
+        st.save().unwrap();
+
+        let r = ready_runner();
+        // Review: edit the source version → re-ask returns 7.10.2 → confirm.
+        let w = ScriptWizard::new()
+            .with(
+                QuestionId::SourceVersion,
+                Outcome::Answered(Answer::Choice("7.10.2".into())),
+            )
+            .with_review(vec![
+                ReviewOutcome::Edit(QuestionId::SourceVersion),
+                ReviewOutcome::Confirm,
+            ]);
+        // Review only runs on a real run (not dry-run). --no-dashboard so the
+        // post-provision live dashboard (needs a TTY) is skipped in tests.
+        let code = dispatch(
+            &args(&["run", "--no-dashboard", "--workspace", ws.to_str().unwrap()]),
+            &r,
+            &w,
+        );
+        assert_eq!(code, 0);
+        // The edit re-asked SourceVersion and the review ran twice.
+        assert!(w.asked.borrow().contains(&QuestionId::SourceVersion));
+        assert_eq!(w.reviewed.get(), 2);
+        // The edited value was persisted.
+        let mut reloaded = State::new(&ws);
+        reloaded.load().unwrap();
+        assert_eq!(
+            reloaded.plan.answers.source_version.as_deref(),
+            Some("7.10.2")
+        );
+    }
+
     #[test]
     fn cancelling_wizard_aborts_with_error() {
         let tmp = tempfile::tempdir().unwrap();
@@ -893,9 +1087,11 @@ mod tests {
             &w,
         );
         assert_eq!(code, 0);
-        // Provisioned: kind clusters + MA install invoked.
+        // Provisioned: kind clusters + MA install invoked. (Use the install-URL
+        // marker, not the bare repo name — the startup update check also curls a
+        // GitHub URL containing "opensearch-migrations".)
         assert!(r.any_call_contains("kind create cluster --name ma-demo-source"));
-        assert!(r.any_call_contains("AndreKurait/opensearch-migrations"));
+        assert!(r.any_call_contains("opensearch-migrations/releases/download/3.3.1"));
         // Did NOT exec the MA binary (non-interactive guard).
         assert!(!r.any_call_contains("/migration-assistant"));
     }

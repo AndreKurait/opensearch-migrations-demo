@@ -11,7 +11,7 @@
 //! On a non-interactive run the TUI is never entered — the dispatcher fills
 //! answers from defaults directly.
 
-use crate::wizard::{Answer, Choice, Kind, Question};
+use crate::wizard::{Answer, Choice, Kind, Question, QuestionId, ReviewRow};
 use ratatui::{
     layout::{Constraint, Layout},
     style::Stylize,
@@ -312,6 +312,162 @@ fn run_event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     mut screen: Screen,
 ) -> std::io::Result<Outcome> {
+    use ratatui::crossterm::event::{self, Event};
+    loop {
+        terminal.draw(|f| screen.view(f))?;
+        if let Some(outcome) = &screen.outcome {
+            return Ok(outcome.clone());
+        }
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.is_press() {
+                    if let Some(msg) = screen.key_to_msg(key.code) {
+                        screen.update(msg);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Review screen — the editable "here's the whole plan" surface shown before
+// provisioning (every run, including resume). The user can move to any row and
+// Enter to edit it, press `c`/F to confirm, or Esc to cancel.
+// ---------------------------------------------------------------------------
+
+/// What the review screen returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewOutcome {
+    /// Proceed to provisioning with the plan as shown.
+    Confirm,
+    /// Re-ask this question to edit its value, then return to the review.
+    Edit(QuestionId),
+    /// Abort the run.
+    Cancel,
+}
+
+/// A message the review screen reacts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewMsg {
+    Down,
+    Up,
+    /// Edit the focused row.
+    Edit,
+    /// Confirm + provision.
+    Confirm,
+    /// Cancel the run.
+    Cancel,
+}
+
+/// The review model: the rows + the cursor.
+#[derive(Debug, Clone)]
+pub struct ReviewScreen {
+    pub rows: Vec<ReviewRow>,
+    pub cursor: usize,
+    pub outcome: Option<ReviewOutcome>,
+}
+
+impl ReviewScreen {
+    pub fn new(rows: Vec<ReviewRow>) -> Self {
+        Self {
+            rows,
+            cursor: 0,
+            outcome: None,
+        }
+    }
+
+    /// Map a key to a [`ReviewMsg`]. Up/down move; Enter/e edits the focused
+    /// row; c/y confirm; Esc/q cancel. Pure, so the bindings are testable.
+    pub fn key_to_msg(&self, code: ratatui::crossterm::event::KeyCode) -> Option<ReviewMsg> {
+        use ratatui::crossterm::event::KeyCode::*;
+        match code {
+            Down | Char('j') => Some(ReviewMsg::Down),
+            Up | Char('k') => Some(ReviewMsg::Up),
+            Enter | Char('e') => Some(ReviewMsg::Edit),
+            Char('c') | Char('y') => Some(ReviewMsg::Confirm),
+            Esc | Char('q') => Some(ReviewMsg::Cancel),
+            _ => None,
+        }
+    }
+
+    /// The sole mutation point.
+    pub fn update(&mut self, msg: ReviewMsg) {
+        let n = self.rows.len().max(1);
+        match msg {
+            ReviewMsg::Down => self.cursor = (self.cursor + 1) % n,
+            ReviewMsg::Up => self.cursor = (self.cursor + n - 1) % n,
+            ReviewMsg::Edit => {
+                if let Some(r) = self.rows.get(self.cursor) {
+                    self.outcome = Some(ReviewOutcome::Edit(r.question));
+                }
+            }
+            ReviewMsg::Confirm => self.outcome = Some(ReviewOutcome::Confirm),
+            ReviewMsg::Cancel => self.outcome = Some(ReviewOutcome::Cancel),
+        }
+    }
+
+    pub fn view(&self, frame: &mut Frame) {
+        frame.render_widget(self, frame.area());
+    }
+}
+
+impl Widget for &ReviewScreen {
+    fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        let block =
+            Block::bordered().title(" Review the plan — edit anything before provisioning ".bold());
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let [title_a, body_a, hint_a] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+
+        Paragraph::new(vec![
+            Line::from("Nothing is created yet. Review every setting below.".dim()),
+            Line::from("".dim()),
+        ])
+        .render(title_a, buf);
+
+        let lines: Vec<Line> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let on = i == self.cursor;
+                let caret = if on { "▶ " } else { "  " };
+                let label = Span::from(format!("{caret}{:<18}", r.label));
+                let label = if on { label.bold() } else { label };
+                let mut line = Line::from(vec![label, Span::from(r.value.clone())]);
+                if on {
+                    line = line.reversed();
+                }
+                line
+            })
+            .collect();
+        Paragraph::new(lines).render(body_a, buf);
+
+        Paragraph::new("↑↓ move · Enter/e edit · c confirm & provision · Esc cancel".dim())
+            .render(hint_a, buf);
+    }
+}
+
+/// Drive the review screen to a [`ReviewOutcome`]. Sets up + always restores
+/// the terminal.
+pub fn run_review(rows: Vec<ReviewRow>) -> std::io::Result<ReviewOutcome> {
+    let mut terminal = ratatui::try_init()?;
+    let result = run_review_loop(&mut terminal, ReviewScreen::new(rows));
+    ratatui::restore();
+    result
+}
+
+fn run_review_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    mut screen: ReviewScreen,
+) -> std::io::Result<ReviewOutcome> {
     use ratatui::crossterm::event::{self, Event};
     loop {
         terminal.draw(|f| screen.view(f))?;

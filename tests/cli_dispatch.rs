@@ -6,19 +6,27 @@
 use ma_demo::cli::{self, Wizardish};
 use ma_demo::error::{Error, Result};
 use ma_demo::runner::MockRunner;
-use ma_demo::tui::Outcome;
-use ma_demo::wizard::{self, Answer, QuestionId};
+use ma_demo::tui::{Outcome, ReviewOutcome};
+use ma_demo::wizard::{self, Answer, QuestionId, ReviewRow};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// A scripted wizard returning canned outcomes keyed by question id.
+/// A scripted wizard returning canned outcomes keyed by question id, plus a
+/// queue of review outcomes (defaults to Confirm).
 struct Script {
     answers: HashMap<QuestionId, Outcome>,
+    review: RefCell<Vec<ReviewOutcome>>,
 }
 impl Script {
     fn new() -> Self {
         Self {
             answers: HashMap::new(),
+            review: RefCell::new(Vec::new()),
         }
+    }
+    fn with_review(self, outs: Vec<ReviewOutcome>) -> Self {
+        *self.review.borrow_mut() = outs;
+        self
     }
     fn full_local() -> Self {
         let mut s = Self::new();
@@ -56,6 +64,14 @@ impl Wizardish for Script {
             .get(&question.id)
             .cloned()
             .ok_or_else(|| Error::die(format!("no scripted answer for {:?}", question.id)))
+    }
+    fn review(&self, _rows: &[ReviewRow]) -> Result<ReviewOutcome> {
+        let mut q = self.review.borrow_mut();
+        if q.is_empty() {
+            Ok(ReviewOutcome::Confirm)
+        } else {
+            Ok(q.remove(0))
+        }
     }
 }
 
@@ -132,7 +148,25 @@ fn full_run_provisions_and_installs_ma() {
     assert_eq!(code, 0);
     assert!(r.any_call_contains("kind create cluster --name ma-demo-source"));
     assert!(r.any_call_contains("kind create cluster --name ma-demo-target"));
-    assert!(r.any_call_contains("AndreKurait/opensearch-migrations"));
+    assert!(r.any_call_contains("opensearch-migrations/releases/download/3.3.1"));
+}
+
+#[test]
+fn cancelling_at_the_review_provisions_nothing() {
+    // The footgun fix end-to-end: even a fully-answered plan reaches the review
+    // gate; cancelling there creates nothing.
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let r = ready_runner();
+    let w = Script::full_local().with_review(vec![ReviewOutcome::Cancel]);
+    let code = cli::dispatch(
+        &args(&["run", "--no-dashboard", "--workspace", ws.to_str().unwrap()]),
+        &r,
+        &w,
+    );
+    assert_eq!(code, 0);
+    assert!(!r.any_call_contains("kind create"));
+    assert!(!r.any_call_contains("opensearch-migrations/releases/download/3.3.1"));
 }
 
 #[test]
@@ -222,7 +256,7 @@ fn local_helm_handoff_deploys_ma_to_kind_and_execs_console() {
     assert!(r.any_call_contains("kind create cluster --name ma-demo-ma"));
     assert!(r.any_call_contains("upgrade --install --create-namespace"));
     assert!(r.any_call_contains("opensearchstaging/opensearch-migrations-console"));
-    assert!(!r.any_call_contains("AndreKurait/opensearch-migrations"));
+    assert!(!r.any_call_contains("opensearch-migrations/releases/download/3.3.1"));
     std::env::remove_var("MA_CHART_PATH");
 }
 

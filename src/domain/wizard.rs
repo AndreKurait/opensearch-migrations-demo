@@ -99,6 +99,134 @@ pub fn default_checked(q: &Question) -> Vec<String> {
     }
 }
 
+/// One row of the review screen: the question it came from (so it can be
+/// re-asked / edited), a human label, and the current value as a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRow {
+    pub question: QuestionId,
+    pub label: String,
+    pub value: String,
+}
+
+/// Build the editable review of the current plan — one row per *applicable*
+/// answer, in flow order. Selecting a row re-asks `row.question`. This is the
+/// "show everything before provisioning, let me edit any of it" surface that
+/// runs every time (including resume), so a saved plan never auto-proceeds.
+pub fn review_rows(a: &Answers) -> Vec<ReviewRow> {
+    let mut rows = Vec::new();
+    let mut push = |question, label: &str, value: String| {
+        rows.push(ReviewRow {
+            question,
+            label: label.to_string(),
+            value,
+        });
+    };
+    let dash = "—".to_string();
+
+    push(
+        QuestionId::Target,
+        "Where",
+        a.target
+            .map(|t| t.label().to_string())
+            .unwrap_or_else(|| dash.clone()),
+    );
+    push(
+        QuestionId::SourceEngine,
+        "Source engine",
+        a.source_engine
+            .map(|e| e.label().to_string())
+            .unwrap_or_else(|| dash.clone()),
+    );
+    push(
+        QuestionId::SourceVersion,
+        "Source version",
+        a.source_version.clone().unwrap_or_else(|| dash.clone()),
+    );
+    push(
+        QuestionId::SourcePlugins,
+        "Source plugins",
+        if a.source_plugins.is_empty() {
+            "(none)".into()
+        } else {
+            a.source_plugins.join(", ")
+        },
+    );
+    push(
+        QuestionId::SnapshotStorage,
+        "Snapshot storage",
+        a.snapshot_storage
+            .map(|s| s.label().to_string())
+            .unwrap_or_else(|| dash.clone()),
+    );
+    push(
+        QuestionId::TargetMode,
+        "Target",
+        a.target_mode
+            .map(|m| m.label().to_string())
+            .unwrap_or_else(|| dash.clone()),
+    );
+    if applies(QuestionId::TargetKind, a) {
+        push(
+            QuestionId::TargetKind,
+            "Target kind",
+            a.target_kind
+                .map(|k| k.label().to_string())
+                .unwrap_or_else(|| dash.clone()),
+        );
+    }
+    if applies(QuestionId::TargetVersion, a) {
+        push(
+            QuestionId::TargetVersion,
+            "Target version",
+            a.target_version.clone().unwrap_or_else(|| dash.clone()),
+        );
+    }
+    if applies(QuestionId::AwsProfile, a) {
+        push(
+            QuestionId::AwsProfile,
+            "AWS profile",
+            a.effective_aws_profile().to_string(),
+        );
+        push(
+            QuestionId::AwsRegion,
+            "AWS region",
+            a.effective_aws_region().to_string(),
+        );
+    }
+    push(
+        QuestionId::Clients,
+        "Client apps",
+        if a.clients.is_empty() {
+            "(none)".into()
+        } else {
+            a.clients
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    );
+    push(
+        QuestionId::SeedData,
+        "Seed sample data",
+        if a.seed_data == Some(true) {
+            "yes".into()
+        } else {
+            "no".into()
+        },
+    );
+    if applies(QuestionId::MaHandoff, a) {
+        push(
+            QuestionId::MaHandoff,
+            "MA handoff",
+            a.ma_handoff
+                .map(|h| h.label().to_string())
+                .unwrap_or_else(|| dash.clone()),
+        );
+    }
+    rows
+}
+
 /// A fully-resolved question to present: its id, prompt, help, and input kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Question {
