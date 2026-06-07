@@ -516,6 +516,8 @@ fn plugin_choices(eng: SourceEngine, version: &str) -> Vec<Choice> {
             ),
             Choice::new("analysis-phonetic", "analysis-phonetic")
                 .desc("Phonetic token filters (soundex, metaphone) for fuzzy name search."),
+            Choice::new("mapper-size", "mapper-size")
+                .desc("Records each document's _size in bytes as a mapped field."),
         ],
         SourceEngine::Solr => solr_plugin_choices(version),
     }

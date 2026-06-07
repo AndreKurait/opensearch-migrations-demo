@@ -8,7 +8,7 @@
 //! for any set of answers is asserted in unit tests with no Docker.
 
 use crate::manifests;
-use crate::model::{Answers, SnapshotStorage, SourceEngine, Target};
+use crate::model::{Answers, SnapshotStorage, SourceEngine, Target, DEFAULT_TARGET_VERSION};
 
 /// The fork release the harness installs the Migration Assistant CLI from.
 pub const MA_REPO: &str = "AndreKurait/opensearch-migrations";
@@ -170,7 +170,10 @@ pub fn build(answers: &Answers) -> ProvisionPlan {
     if answers.provisions_local_target() {
         // Local OpenSearch in its own KIND cluster.
         let tgt_cluster = answers.target_cluster();
-        let ver = answers.target_version.as_deref().unwrap_or("3.3.0");
+        let ver = answers
+            .target_version
+            .as_deref()
+            .unwrap_or(DEFAULT_TARGET_VERSION);
         actions.push(Action::CreateKindCluster {
             name: tgt_cluster.clone(),
             config: manifests::kind_config(&tgt_cluster, 29200, 30920),

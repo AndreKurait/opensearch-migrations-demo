@@ -12,7 +12,7 @@
 //! snapshots. The intent is a realistic, reviewable starting point — not a
 //! turnkey production module.
 
-use crate::model::{Answers, SnapshotStorage, SourceEngine, TargetMode};
+use crate::model::{Answers, SnapshotStorage, SourceEngine, TargetMode, DEFAULT_TARGET_VERSION};
 
 /// The provider + variables file shared by source and target.
 pub fn providers_tf(region: &str) -> String {
@@ -288,8 +288,8 @@ resource "aws_opensearchserverless_access_policy" "data" {
   type = "data"
   policy = jsonencode([{
     Rules = [
-      { ResourceType = "collection", Resource = ["collection/${local.collection}"], Permission = ["aoss:*"] },
-      { ResourceType = "index", Resource = ["index/${local.collection}/*"], Permission = ["aoss:*"] }
+      { ResourceType = "collection", Resource = ["collection/${local.collection}"], Permission = ["aoss:CreateCollectionItems", "aoss:DeleteCollectionItems", "aoss:UpdateCollectionItems", "aoss:DescribeCollectionItems"] },
+      { ResourceType = "index", Resource = ["index/${local.collection}/*"], Permission = ["aoss:CreateIndex", "aoss:DeleteIndex", "aoss:UpdateIndex", "aoss:DescribeIndex", "aoss:ReadDocument", "aoss:WriteDocument"] }
     ]
     Principal = [data.aws_caller_identity.current.arn]
   }])
@@ -358,7 +358,10 @@ pub fn files(answers: &Answers) -> Vec<TfFile> {
         });
     } else if answers.target_mode == Some(TargetMode::Provision) {
         // A managed Amazon OpenSearch Service domain.
-        let tv = answers.target_version.as_deref().unwrap_or("3.3.0");
+        let tv = answers
+            .target_version
+            .as_deref()
+            .unwrap_or(DEFAULT_TARGET_VERSION);
         let mm = major_minor(tv);
         out.push(TfFile {
             path: "terraform/target.tf".into(),
@@ -497,6 +500,16 @@ mod tests {
             .contains("aws_opensearchserverless_access_policy"));
         assert!(target.body.contains("collection_endpoint"));
         assert!(!target.body.contains("aws_opensearch_domain"));
+        // Least-privilege data policy: scoped verbs, not a blanket aoss:*
+        // (converged with the CLI path's grant).
+        assert!(
+            target.body.contains("aoss:WriteDocument"),
+            "data policy grants the scoped write verb"
+        );
+        assert!(
+            !target.body.contains("\"aoss:*\""),
+            "data policy must not grant aoss:* wildcard"
+        );
         // Provider must be >= 6 for the collection_group resource.
         let providers = f.iter().find(|t| t.path.ends_with("providers.tf")).unwrap();
         assert!(providers.body.contains("~> 6.0"));

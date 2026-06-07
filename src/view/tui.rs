@@ -482,9 +482,19 @@ impl ReviewScreen {
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(
-            "Nothing is created yet. Review every setting below.".dim(),
-        ));
+        // The pre-provision reassurance. When the plan touches AWS (the `aws`
+        // lines are present), confirming will create *billable* cloud resources,
+        // so flag that in yellow instead of the calmer local reassurance.
+        if c.aws.is_empty() {
+            lines.push(Line::from(
+                "Nothing is created yet. Review every setting below.".dim(),
+            ));
+        } else {
+            lines.push(Line::from(
+                "Confirming will create real, billable AWS resources. Review every setting below."
+                    .yellow(),
+            ));
+        }
         lines.push(Line::from(""));
         lines
     }
@@ -559,7 +569,7 @@ impl Widget for &ReviewScreen {
             .collect();
         Paragraph::new(lines).render(body_a, buf);
 
-        Paragraph::new("↑↓ move · Enter/e edit · c confirm & provision · Esc cancel".dim())
+        Paragraph::new("↑↓ move · Enter/e edit · c confirm & provision · q/Esc/^C cancel".dim())
             .render(hint_a, buf);
     }
 }
@@ -821,6 +831,26 @@ mod tests {
         assert!(text.contains("Review the plan"), "title bar");
         // The plan rows still render.
         assert!(text.contains("Where"));
+        // An AWS-touching plan flags the billable consequence.
+        assert!(
+            text.contains("billable AWS resources"),
+            "cloud plan warns about billable resources"
+        );
+    }
+
+    #[test]
+    fn review_without_aws_uses_calm_reassurance_not_billing_warning() {
+        let ctx = ReviewContext {
+            version: "0.1.2".into(),
+            workspace: "/tmp/ws".into(),
+            aws: Vec::new(),
+            aws_warning: false,
+            update_hint: None,
+        };
+        let screen = ReviewScreen::with_context(review_rows(), ctx);
+        let text = review_text(&screen, 100, 30);
+        assert!(text.contains("Nothing is created yet"));
+        assert!(!text.contains("billable AWS resources"));
     }
 
     #[test]

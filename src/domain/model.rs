@@ -62,8 +62,10 @@ impl SourceEngine {
     pub fn versions(self) -> &'static [&'static str] {
         match self {
             // ES images live on docker.elastic.co; these are the common
-            // migration-source majors the MA test matrix exercises.
-            SourceEngine::Elasticsearch => &["8.17.0", "7.17.22", "7.10.2", "6.8.23", "5.6.16"],
+            // migration-source majors the MA test matrix exercises. (ES 5.6 is
+            // omitted: it predates `discovery.type: single-node` — added in 6.0 —
+            // which the source env block sets, so a 5.6 container won't boot here.)
+            SourceEngine::Elasticsearch => &["8.17.0", "7.17.22", "7.10.2", "6.8.23"],
             // OS source images on docker hub / public.ecr.aws.
             SourceEngine::OpenSearch => &["2.19.0", "2.15.0", "1.3.20"],
             // Solr is backfill-only. Latest of each supported major: 9.7,
@@ -167,6 +169,11 @@ impl TargetKind {
 
 /// The selectable target OpenSearch versions, newest first.
 pub const TARGET_VERSIONS: &[&str] = &["3.3.0", "3.1.0", "2.19.0"];
+
+/// The default target OpenSearch version (newest) — used as the fallback when a
+/// plan didn't pin one. Single source of truth so the planner and Terraform
+/// emitter can't drift to different literals.
+pub const DEFAULT_TARGET_VERSION: &str = TARGET_VERSIONS[0];
 
 /// How the harness hands the environment off to the Migration Assistant at the
 /// end of a run.
@@ -367,6 +374,24 @@ mod tests {
         ] {
             assert!(!e.versions().is_empty(), "{} has no versions", e.id());
         }
+    }
+
+    #[test]
+    fn es_5x_is_not_offered() {
+        // ES 5.6 predates `discovery.type: single-node`, which the source env
+        // sets — a 5.6 container won't boot, so it must not be selectable.
+        assert!(
+            !SourceEngine::Elasticsearch
+                .versions()
+                .iter()
+                .any(|v| v.starts_with("5.")),
+            "ES 5.x must not be offered"
+        );
+    }
+
+    #[test]
+    fn default_target_version_is_the_newest() {
+        assert_eq!(DEFAULT_TARGET_VERSION, TARGET_VERSIONS[0]);
     }
 
     #[test]
