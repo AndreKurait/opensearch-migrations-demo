@@ -31,6 +31,13 @@ impl Output {
     pub fn trimmed_stdout(&self) -> &str {
         self.stdout.trim_end_matches('\n')
     }
+
+    /// `stdout` fully trimmed of surrounding whitespace — for callers that want
+    /// a single token regardless of leading/trailing spaces or newlines (an ARN,
+    /// a name, a status). Avoids the `trimmed_stdout().trim()` double-trim idiom.
+    pub fn trimmed(&self) -> &str {
+        self.stdout.trim()
+    }
 }
 
 /// Abstraction over running an external program with arguments.

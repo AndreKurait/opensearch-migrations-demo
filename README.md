@@ -190,7 +190,7 @@ and launches it. From there the Migration Assistant drives the migration itself
 ## Development
 
 ```sh
-cargo test                              # 120+ unit + integration tests
+cargo test                              # full unit + integration suite
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo build --release

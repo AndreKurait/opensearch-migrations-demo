@@ -1,14 +1,17 @@
 # Terraform — AWS cloud path
 
-These modules are the **cloud** counterpart to the local KIND provisioning. The
-TUI emits equivalent files into your workspace when you pick *Cloud*; the
-standalone examples here are the same shape, checked in for reference and so you
-can `terraform apply` them directly.
+These standalone modules are **reference examples** of the cloud counterpart to
+the local KIND provisioning, checked in so you can read and `terraform apply`
+them directly.
 
-> **Not applied by the harness.** Per the demo design, the TUI *writes* the
-> Terraform but never runs it. Review the plan and apply it yourself. These
-> modules are a realistic starting point, not a hardened production module —
-> they default to permissive CIDRs and small instances for a demo.
+> **How the harness uses Terraform.** When you pick *Cloud*, the TUI generates an
+> equivalent module into your workspace's `terraform/` and — after you confirm at
+> the review screen — runs `terraform init && terraform apply -auto-approve` for
+> you, streaming the output live. Pass `--no-apply` (or, non-interactively, omit
+> `--apply`) to have it emit the files only and apply them yourself. The modules
+> here are a realistic starting point, not a hardened production module — the
+> emitted source instance is private-by-design (dedicated VPC + NAT, no public
+> IP), but these defaults target a throwaway demo.
 
 ## Modules
 

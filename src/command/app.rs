@@ -316,7 +316,7 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
                 "text",
             ],
         );
-        let arn = out.trimmed_stdout().trim().to_string();
+        let arn = out.trimmed().to_string();
         if !out.success() || arn.is_empty() || arn == "None" {
             return Err(Error::die(
                 "could not resolve your AWS identity (sts get-caller-identity) — the AOSS data \

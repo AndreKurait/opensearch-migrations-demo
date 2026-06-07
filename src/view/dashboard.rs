@@ -246,9 +246,9 @@ fn probe_cloud<R: CommandRunner>(runner: &R, answers: &Answers, tick: u64) -> Sn
         snap.clusters
             .push(Row::new("AWS", Health::Down, "aws CLI not on PATH"));
     } else {
-        match aws_caller_arn(runner, &profile, &region) {
+        match crate::aws::caller_identity(runner, &profile, &region) {
             Some(arn) => {
-                let acct = arn.split(':').nth(4).unwrap_or("?").to_string();
+                let acct = crate::aws::account_of(&arn).unwrap_or_else(|| "?".into());
                 snap.clusters.push(Row::new(
                     "AWS account",
                     Health::Up,
@@ -449,28 +449,7 @@ fn parse_count(json: &str) -> Option<u64> {
 }
 
 // ---- cloud (AWS) probe helpers ----
-
-/// The caller ARN for a profile/region (`aws sts get-caller-identity`), or
-/// `None` when credentials are missing/expired.
-fn aws_caller_arn<R: CommandRunner>(runner: &R, profile: &str, region: &str) -> Option<String> {
-    let out = runner.run(
-        "aws",
-        &[
-            "sts",
-            "get-caller-identity",
-            "--profile",
-            profile,
-            "--region",
-            region,
-            "--query",
-            "Arn",
-            "--output",
-            "text",
-        ],
-    );
-    let arn = out.trimmed_stdout().trim();
-    (out.success() && !arn.is_empty() && arn != "None").then(|| arn.to_string())
-}
+// (caller identity uses the shared crate::aws::caller_identity helper.)
 
 /// Status of the EC2 source instance (tagged `Name=<name>`): its instance-state
 /// → health, plus a short detail. Pending when no matching instance exists yet.
@@ -533,7 +512,7 @@ fn s3_bucket_status<R: CommandRunner>(
     if !out.success() {
         return (Health::Pending, "querying".into());
     }
-    let name = out.trimmed_stdout().trim();
+    let name = out.trimmed();
     if name.is_empty() || name == "None" {
         (Health::Pending, "not created yet".into())
     } else {
@@ -623,7 +602,7 @@ fn statefulset_ready<R: CommandRunner>(
     if !out.success() {
         return (Health::Pending, "deploying".into());
     }
-    let s = out.trimmed_stdout().trim().to_string();
+    let s = out.trimmed().to_string();
     if let Some((a, b)) = s.split_once('/') {
         if a == b && a != "0" && !a.is_empty() {
             return (Health::Up, format!("ready {s}"));

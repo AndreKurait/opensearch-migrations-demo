@@ -100,7 +100,7 @@ pub fn caller_identity<R: CommandRunner>(
             "text",
         ],
     );
-    let arn = out.trimmed_stdout().trim();
+    let arn = out.trimmed();
     if out.success() && !arn.is_empty() && arn != "None" {
         Some(arn.to_string())
     } else {

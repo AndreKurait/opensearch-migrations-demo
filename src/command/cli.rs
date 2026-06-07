@@ -17,7 +17,8 @@ use crate::wizard::{self, QuestionId};
 use crate::{dashboard, terraform, ui};
 use std::path::PathBuf;
 
-/// The harness version, stamped from build.rs (CLI_VERSION) or a dev default.
+/// The harness version: the `DEMO_VERSION` env stamped by build.rs at release
+/// build time (set from the git tag), or a dev default for a plain `cargo build`.
 pub const VERSION: &str = match option_env!("DEMO_VERSION") {
     Some(v) => v,
     None => "0.1.0-dev",

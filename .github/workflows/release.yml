@@ -51,6 +51,11 @@ jobs:
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Install cross-linker (linux aarch64)
         if: matrix.linker != ''
         run: |
@@ -67,6 +72,20 @@ jobs:
         env:
           DEMO_VERSION: ${{ steps.ver.outputs.stripped }}
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify stamped version
+        # The build must embed the tag's version (DEMO_VERSION). Catch an empty
+        # or mismatched stamp before publishing. Skip the cross-built linux
+        # aarch64 binary (can't exec it on the x86_64 runner); the others run
+        # natively on their runner.
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          want="${{ steps.ver.outputs.stripped }}"
+          [ -n "$want" ] || { echo "::error::empty version"; exit 1; }
+          got="$(target/${{ matrix.target }}/release/ma-demo version)"
+          echo "stamped=$got want=$want"
+          [ "$got" = "$want" ] || { echo "::error::version mismatch: $got != $want"; exit 1; }
 
       - name: Package
         id: pkg
@@ -107,3 +126,51 @@ jobs:
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: install.sh
+
+  # Fail loudly if any expected asset is missing — a matrix leg that errored
+  # would otherwise publish a release with a hole (a platform with no tarball).
+  verify:
+    name: verify release assets
+    needs: [build, installer]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "stripped=${tag#v}" >> "$GITHUB_OUTPUT"
+      - name: Assert all assets attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          v="${{ steps.ver.outputs.stripped }}"
+          tag="${{ steps.ver.outputs.tag }}"
+          mapfile -t assets < <(gh release view "$tag" --json assets --jq '.assets[].name')
+          printf 'found asset: %s\n' "${assets[@]}"
+          want=(
+            "install.sh"
+            "ma-demo-${v}-x86_64-unknown-linux-gnu.tar.gz"
+            "ma-demo-${v}-aarch64-unknown-linux-gnu.tar.gz"
+            "ma-demo-${v}-x86_64-apple-darwin.tar.gz"
+            "ma-demo-${v}-aarch64-apple-darwin.tar.gz"
+          )
+          missing=0
+          for a in "${want[@]}"; do
+            printf '%s\n' "${assets[@]}" | grep -qxF "$a" || { echo "::error::missing asset: $a"; missing=1; }
+            # Every tarball must have its .sha256 sidecar.
+            case "$a" in
+              *.tar.gz)
+                printf '%s\n' "${assets[@]}" | grep -qxF "$a.sha256" || { echo "::error::missing checksum: $a.sha256"; missing=1; } ;;
+            esac
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "All release assets present."
