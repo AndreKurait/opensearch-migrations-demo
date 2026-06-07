@@ -31,6 +31,11 @@ c_bold()  { printf '\033[1m%s\033[0m' "$1"; }
 die() { printf '%s %s\n' "$(c_red 'error:')" "$*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null 2>&1 || die "required command not on PATH: $1"; }
 
+# Module-scoped temp dir; the EXIT trap (set once, here) cleans it whether we
+# succeed or die. Declared before main() so it's in scope under `set -u`.
+tmp=""
+trap '[[ -n "$tmp" ]] && rm -rf "$tmp"' EXIT
+
 require uname
 require tar
 
@@ -73,7 +78,9 @@ main() {
   require curl
   printf 'Installing %s…\n\n' "$(c_bold ma-demo)"
 
-  local target version stripped tarball url tmp
+  # `tmp` is intentionally NOT local — it's the module global the EXIT trap
+  # cleans (the trap fires after main returns, when a local would be gone).
+  local target version stripped tarball url
   target="$(detect_target)"
   version="$(resolve_version)"
   # Asset names embed the version without the leading "v".
@@ -84,8 +91,9 @@ main() {
   printf '  %s %s\n' "$(c_dim 'target:')" "$target"
   printf '  %s %s\n\n' "$(c_dim 'version:')" "$version"
 
+  # A module-scoped temp dir cleaned by the EXIT trap (declared global so the
+  # trap, which fires after main() returns, can still see it under `set -u`).
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
   curl -fsSL --max-time 120 -o "$tmp/$tarball" "$url" \
     || die "could not download $url"
   tar -xzf "$tmp/$tarball" -C "$tmp"
