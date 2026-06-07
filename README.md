@@ -64,11 +64,32 @@ under `bin/`. Re-running resumes from the saved plan.
 | **Target version** | OpenSearch 2.19 / 3.1 / 3.3 (local KIND target only) |
 | **Client apps** | Locust load gen · sample search app (multi-select) |
 | **Seed data** | seed sample documents into the source (yes/no) |
+| **MA handoff** *(local only)* | **deploy MA locally to KIND** (no AWS) · install the MA CLI (deploys to EKS) |
 
 The flow is adaptive — e.g. choosing *leave the target to the Migration
-Assistant* skips both the target-kind and target-version questions, and
-choosing the **AOSS NextGen** target kind skips the version question (a
-serverless collection takes no OpenSearch version).
+Assistant* skips both the target-kind and target-version questions, choosing
+the **AOSS NextGen** target kind skips the version question (a serverless
+collection takes no OpenSearch version), and the MA-handoff question only
+appears for local runs (cloud always installs the EKS-targeting CLI).
+
+### Migration Assistant handoff
+
+Once the environment is up, the harness hands off to the Migration Assistant.
+For **local** runs you choose how:
+
+- **Deploy MA locally to KIND** (default for local, no AWS) — `helm install`s
+  the `migrationAssistantWithArgo` chart into a dedicated KIND cluster
+  (`ma-demo-ma`, node image `kindest/node:v1.35.0` to meet the chart's k8s
+  ≥1.35 floor) with the `opensearchstaging` images, waits for the
+  `migration-console` statefulset, then `kubectl exec`s you into
+  `migration-console-0`. A complete migration with zero cloud dependencies.
+  Requires `helm` + the opensearch-migrations chart (set `MA_CHART_PATH`, or a
+  sibling checkout is auto-detected).
+- **Install the MA CLI** — curls `install.sh` from the
+  [`AndreKurait/opensearch-migrations` 3.3.1 release](https://github.com/AndreKurait/opensearch-migrations/releases/tag/3.3.1)
+  and launches it; the CLI deploys MA to **EKS** (needs AWS).
+
+Override non-interactively with `--ma-handoff deploy-local-helm|install-cli`.
 
 ### Target kinds
 

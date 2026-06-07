@@ -391,6 +391,88 @@ pub fn aoss_delete_access_policy_args(name: &str, region: &str) -> Vec<String> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Local Migration Assistant deploy (helm into a dedicated KIND cluster) —
+// command sequences (pure data). Mirrors the upstream release CI's deploy:
+//   helm dependency update <chart>
+//   helm --kube-context <ctx> upgrade --install --create-namespace -n <ns> <rel> <chart> -f values
+//   kubectl rollout status statefulset/migration-console
+// The orchestrator runs each through the CommandRunner seam.
+// ---------------------------------------------------------------------------
+
+/// The MA helm release name + namespace used by the upstream deploy.
+pub const MA_RELEASE: &str = "ma";
+pub const MA_NAMESPACE: &str = "ma";
+/// The chart subpath within the opensearch-migrations repo checkout.
+pub const MA_CHART_SUBPATH: &str = "deployment/k8s/charts/aggregates/migrationAssistantWithArgo";
+/// The published image-repository prefix the chart pulls MA images from.
+pub const MA_IMAGE_PREFIX: &str = "opensearchstaging";
+
+/// `helm dependency update <chart>` argv.
+pub fn ma_helm_dependency_args(chart_path: &str) -> Vec<String> {
+    vec!["dependency".into(), "update".into(), chart_path.into()]
+}
+
+/// `helm upgrade --install …` argv for the MA chart against a kube context,
+/// with the image prefix + tag set via `--set` (so no values file is needed).
+pub fn ma_helm_install_args(chart_path: &str, kube_context: &str) -> Vec<String> {
+    vec![
+        "--kube-context".into(),
+        kube_context.into(),
+        "upgrade".into(),
+        "--install".into(),
+        "--create-namespace".into(),
+        "-n".into(),
+        MA_NAMESPACE.into(),
+        MA_RELEASE.into(),
+        chart_path.into(),
+        "--timeout".into(),
+        "15m".into(),
+        "--set".into(),
+        format!(
+            "images.migrationConsole.repository={MA_IMAGE_PREFIX}/opensearch-migrations-console"
+        ),
+        "--set".into(),
+        format!("images.migrationConsole.tag={MA_VERSION}"),
+        "--set".into(),
+        format!("images.installer.repository={MA_IMAGE_PREFIX}/opensearch-migrations-console"),
+        "--set".into(),
+        format!("images.installer.tag={MA_VERSION}"),
+    ]
+}
+
+/// `kubectl rollout status statefulset/migration-console` argv.
+pub fn ma_rollout_status_args(kube_context: &str) -> Vec<String> {
+    vec![
+        "--context".into(),
+        kube_context.into(),
+        "-n".into(),
+        MA_NAMESPACE.into(),
+        "rollout".into(),
+        "status".into(),
+        "statefulset/migration-console".into(),
+        "--timeout".into(),
+        "15m".into(),
+    ]
+}
+
+/// The argv to `kubectl exec` into the migration-console (the local handoff
+/// equivalent of the CLI's `console` subcommand).
+pub fn ma_console_exec_args(kube_context: &str) -> Vec<String> {
+    vec![
+        "--context".into(),
+        kube_context.into(),
+        "exec".into(),
+        "--stdin".into(),
+        "--tty".into(),
+        "--namespace".into(),
+        MA_NAMESPACE.into(),
+        "migration-console-0".into(),
+        "--".into(),
+        "/bin/bash".into(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

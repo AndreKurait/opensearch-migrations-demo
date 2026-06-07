@@ -56,6 +56,8 @@ pub struct Flags {
     pub non_interactive: bool,
     pub dry_run: bool,
     pub workspace: Option<String>,
+    /// Overrides the MA handoff: "install-cli" or "deploy-local-helm".
+    pub ma_handoff: Option<String>,
 }
 
 /// Parse flags out of the argument list (order-independent).
@@ -70,9 +72,15 @@ pub fn parse_flags(args: &[String]) -> Flags {
                 f.workspace = args.get(i + 1).cloned();
                 i += 1;
             }
+            "--ma-handoff" => {
+                f.ma_handoff = args.get(i + 1).cloned();
+                i += 1;
+            }
             s => {
                 if let Some(v) = s.strip_prefix("--workspace=") {
                     f.workspace = Some(v.to_string());
+                } else if let Some(v) = s.strip_prefix("--ma-handoff=") {
+                    f.ma_handoff = Some(v.to_string());
                 }
             }
         }
@@ -169,6 +177,14 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
     let mut answers = state.plan.answers.clone();
 
     collect_answers(wiz, &mut answers, flags.non_interactive)?;
+    // An explicit --ma-handoff flag overrides the collected/default choice.
+    if let Some(h) = flags.ma_handoff.as_deref() {
+        answers.ma_handoff = match h {
+            "install-cli" => Some(crate::model::MaHandoff::InstallCli),
+            "deploy-local-helm" => Some(crate::model::MaHandoff::DeployLocalHelm),
+            other => return Err(Error::die(format!("unknown --ma-handoff '{other}'"))),
+        };
+    }
     state.plan.answers = answers.clone();
     state.save()?;
 
@@ -188,8 +204,13 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
     let plan = app.provision(&answers)?;
     print_endpoints(&plan, &answers, app.state.plan.aoss_endpoint.as_deref());
 
-    // Install the Migration Assistant CLI and hand off.
-    let argv = app.install_ma()?;
+    // Hand off to the Migration Assistant. Local-helm deploys MA into KIND and
+    // execs the console; otherwise install the EKS-targeting CLI and launch it.
+    let argv = if answers.deploys_ma_locally() {
+        app.deploy_ma_local()?
+    } else {
+        app.install_ma()?
+    };
     ui::ok("Environment ready. Launching the Migration Assistant…");
     ui::dim(&format!("  $ {}", argv.join(" ")));
     launch_ma(runner, &argv, flags.non_interactive)
@@ -297,10 +318,20 @@ fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
     if !runner.has_command("kind") {
         ui::warn("kind not on PATH; skipping cluster deletion");
     } else {
-        for cluster in [answers.source_cluster(), answers.target_cluster()] {
+        // Source, target, and the dedicated MA cluster (local helm deploy).
+        for cluster in [
+            answers.source_cluster(),
+            answers.target_cluster(),
+            answers.ma_cluster(),
+        ] {
             ui::step(&format!("kind delete cluster {cluster}"));
             // Idempotent: kind exits 0 (with a notice) when the cluster is absent.
-            let out = runner.run("kind", &["delete", "cluster", "--name", &cluster]);
+            // A just-running cluster can lose a `docker rm` race on the first
+            // try, so retry once before warning.
+            let mut out = runner.run("kind", &["delete", "cluster", "--name", &cluster]);
+            if !out.success() {
+                out = runner.run("kind", &["delete", "cluster", "--name", &cluster]);
+            }
             if out.success() {
                 ui::ok(&format!("{cluster} deleted"));
             } else {
@@ -415,6 +446,9 @@ pub fn print_plan(a: &Answers) {
             "no"
         }
     ));
+    if let Some(h) = a.ma_handoff {
+        ui::dim(&format!("  MA handoff      {}", h.label()));
+    }
 }
 
 /// Print the resolved endpoints after provisioning (so the operator + MA know
@@ -457,7 +491,8 @@ Usage:\n\
 Flags:\n\
 \x20 -y, --non-interactive      Accept defaults; for CI / unattended runs.\n\
 \x20 --dry-run, --plan          Stop after printing the plan.\n\
-\x20 --workspace DIR            Workspace dir (default ./migration-demo-workspace).\n\n\
+\x20 --workspace DIR            Workspace dir (default ./migration-demo-workspace).\n\
+\x20 --ma-handoff KIND          MA handoff: deploy-local-helm | install-cli.\n\n\
 This harness stands up a SOURCE search cluster (Elasticsearch / OpenSearch /\n\
 Solr), optional snapshot storage + target OpenSearch, and client apps, locally\n\
 via KIND or as Terraform for AWS — then installs and launches the Migration\n\
@@ -504,6 +539,7 @@ mod tests {
             QuestionId::TargetVersion => "tversion",
             QuestionId::Clients => "clients",
             QuestionId::SeedData => "seed",
+            QuestionId::MaHandoff => "handoff",
             QuestionId::Review => "review",
         }
     }
@@ -618,7 +654,11 @@ mod tests {
                 QuestionId::Clients,
                 Outcome::Answered(Answer::Choices(vec!["locust".into()])),
             )
-            .with(QuestionId::SeedData, Outcome::Answered(Answer::Bool(true)));
+            .with(QuestionId::SeedData, Outcome::Answered(Answer::Bool(true)))
+            .with(
+                QuestionId::MaHandoff,
+                Outcome::Answered(Answer::Choice("install-cli".into())),
+            );
         // `plan` so we stop before provisioning Docker, but after walking the wizard.
         let code = dispatch(
             &args(&["plan", "--workspace", ws.to_str().unwrap()]),
@@ -626,11 +666,13 @@ mod tests {
             &w,
         );
         assert_eq!(code, 0);
-        // The wizard skipped TargetVersion (leave-to-ma).
+        // The wizard skipped TargetVersion (leave-to-ma) but asked the handoff
+        // (local run).
         let asked = w.asked.borrow();
         assert!(asked.contains(&QuestionId::Target));
         assert!(asked.contains(&QuestionId::SeedData));
         assert!(!asked.contains(&QuestionId::TargetVersion));
+        assert!(asked.contains(&QuestionId::MaHandoff));
     }
 
     #[test]
@@ -736,8 +778,19 @@ mod tests {
         let ws = tmp.path().join("ws");
         let r = ready_runner();
         let w = ScriptWizard::new();
-        // Default run (launch=true) but non-interactive → launch_ma reports only.
-        let code = dispatch(&args(&["-y", "--workspace", ws.to_str().unwrap()]), &r, &w);
+        // Non-interactive, with the CLI-install handoff explicitly selected
+        // (the local-helm default would need helm + the chart).
+        let code = dispatch(
+            &args(&[
+                "-y",
+                "--ma-handoff",
+                "install-cli",
+                "--workspace",
+                ws.to_str().unwrap(),
+            ]),
+            &r,
+            &w,
+        );
         assert_eq!(code, 0);
         // Provisioned: kind clusters + MA install invoked.
         assert!(r.any_call_contains("kind create cluster --name ma-demo-source"));

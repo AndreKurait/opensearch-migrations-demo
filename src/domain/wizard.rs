@@ -13,7 +13,7 @@
 //! path fills answers from defaults the same way.
 
 use crate::model::{
-    Answers, ClientApp, SnapshotStorage, SourceEngine, Target, TargetKind, TargetMode,
+    Answers, ClientApp, MaHandoff, SnapshotStorage, SourceEngine, Target, TargetKind, TargetMode,
     TARGET_VERSIONS,
 };
 
@@ -32,6 +32,8 @@ pub enum QuestionId {
     TargetVersion,
     Clients,
     SeedData,
+    /// How to hand off to the Migration Assistant (local runs only).
+    MaHandoff,
     /// Terminal: everything needed is answered; show the review screen.
     Review,
 }
@@ -87,7 +89,7 @@ pub enum Answer {
 /// The ordered list of *candidate* questions. [`next_question`] walks this in
 /// order and returns the first whose answer is still missing AND that applies
 /// given the current answers.
-const FLOW: [QuestionId; 10] = [
+const FLOW: [QuestionId; 11] = [
     QuestionId::Target,
     QuestionId::SourceEngine,
     QuestionId::SourceVersion,
@@ -98,6 +100,7 @@ const FLOW: [QuestionId; 10] = [
     QuestionId::TargetVersion,
     QuestionId::Clients,
     QuestionId::SeedData,
+    QuestionId::MaHandoff,
 ];
 
 /// Whether question `q` applies given the answers so far. Questions that don't
@@ -110,6 +113,9 @@ fn applies(q: QuestionId, a: &Answers) -> bool {
         // OpenSearch target — an AOSS NextGen collection takes no version, and
         // leaving the target to MA needs no version either.
         QuestionId::TargetVersion => a.provisions_local_target(),
+        // The MA-handoff choice (CLI vs local helm deploy) is only meaningful
+        // for local runs; cloud always installs the EKS-targeting CLI.
+        QuestionId::MaHandoff => a.target == Some(Target::Local),
         _ => true,
     }
 }
@@ -131,6 +137,7 @@ fn answered(q: QuestionId, a: &Answers) -> bool {
         QuestionId::TargetVersion => a.target_version.is_some(),
         QuestionId::Clients => a.clients_done,
         QuestionId::SeedData => a.seed_data.is_some(),
+        QuestionId::MaHandoff => a.ma_handoff.is_some(),
         QuestionId::Review => true,
     }
 }
@@ -254,8 +261,17 @@ pub fn build(id: QuestionId, a: &Answers) -> Question {
         QuestionId::SeedData => Question {
             id,
             title: "Pre-seed the source with sample documents before migrating?".into(),
-            help: "Runs the repo's DataGenerator workloads (HTTP logs, geonames, nested, NYC taxis) so the migration has real indices to move.".into(),
+            help: "Seeds the source with sample docs over its REST API so the migration has real indices to move.".into(),
             kind: Kind::YesNo,
+        },
+        QuestionId::MaHandoff => Question {
+            id,
+            title: "How should the Migration Assistant be launched?".into(),
+            help: "Install the MA CLI (it deploys MA to EKS — needs AWS), or deploy MA locally into its own KIND cluster via helm for a fully-local, no-AWS migration.".into(),
+            kind: Kind::SingleChoice(vec![
+                Choice::new(MaHandoff::DeployLocalHelm.id(), MaHandoff::DeployLocalHelm.label()),
+                Choice::new(MaHandoff::InstallCli.id(), MaHandoff::InstallCli.label()),
+            ]),
         },
         QuestionId::Review => Question {
             id,
@@ -345,6 +361,9 @@ pub fn apply(a: &mut Answers, id: QuestionId, ans: Answer) -> QuestionId {
         (QuestionId::SeedData, Answer::Bool(b)) => {
             a.seed_data = Some(b);
         }
+        (QuestionId::MaHandoff, Answer::Choice(c)) => {
+            a.ma_handoff = parse_ma_handoff(&c);
+        }
         // Any other (id, answer) pairing is a programming error in the caller;
         // ignore it rather than panic so the loop stays robust.
         _ => {}
@@ -396,6 +415,13 @@ fn parse_client(s: &str) -> Option<ClientApp> {
         _ => None,
     }
 }
+fn parse_ma_handoff(s: &str) -> Option<MaHandoff> {
+    match s {
+        "install-cli" => Some(MaHandoff::InstallCli),
+        "deploy-local-helm" => Some(MaHandoff::DeployLocalHelm),
+        _ => None,
+    }
+}
 
 /// Fill every remaining answer with a sensible default (the non-interactive /
 /// `-y` path). Idempotent: only unset fields are filled.
@@ -433,6 +459,15 @@ pub fn fill_defaults(a: &mut Answers) {
             a.clients = vec![ClientApp::Locust, ClientApp::SampleSearchApp];
         }
         a.clients_done = true;
+    }
+    // MA handoff: local runs default to the no-AWS local helm deploy; cloud runs
+    // install the EKS-targeting CLI.
+    if a.ma_handoff.is_none() {
+        a.ma_handoff = Some(if a.target == Some(Target::Local) {
+            MaHandoff::DeployLocalHelm
+        } else {
+            MaHandoff::InstallCli
+        });
     }
     // Plugins default to empty but the question counts as answered.
     a.plugins_done = true;
@@ -521,8 +556,17 @@ mod tests {
             ),
             QuestionId::SeedData
         );
+        // Local run → SeedData is followed by the MA-handoff choice.
         assert_eq!(
             apply(&mut a, QuestionId::SeedData, Answer::Bool(true)),
+            QuestionId::MaHandoff
+        );
+        assert_eq!(
+            apply(
+                &mut a,
+                QuestionId::MaHandoff,
+                Answer::Choice("deploy-local-helm".into())
+            ),
             QuestionId::Review
         );
         // Everything is set.
@@ -531,6 +575,7 @@ mod tests {
         assert_eq!(a.target_version.as_deref(), Some("3.3.0"));
         assert_eq!(a.clients, vec![ClientApp::Locust]);
         assert_eq!(a.seed_data, Some(true));
+        assert!(a.deploys_ma_locally());
     }
 
     #[test]

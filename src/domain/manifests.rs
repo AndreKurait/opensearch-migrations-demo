@@ -46,12 +46,19 @@ pub fn kind_config(cluster_name: &str, host_port: u16, node_port: u16) -> String
          name: {cluster_name}\n\
          nodes:\n\
          \x20 - role: control-plane\n\
+         \x20   image: {KIND_NODE_IMAGE}\n\
          \x20   extraPortMappings:\n\
          \x20     - containerPort: {node_port}\n\
          \x20       hostPort: {host_port}\n\
          \x20       protocol: TCP\n"
     )
 }
+
+/// The KIND node image all clusters are pinned to. The Migration Assistant helm
+/// chart requires Kubernetes >= 1.35.0 (`kubeVersion` in its Chart.yaml), and
+/// the upstream release CI provisions exactly this node image — so pinning it
+/// here lets the harness deploy MA locally on the same substrate it verifies.
+pub const KIND_NODE_IMAGE: &str = "kindest/node:v1.35.0";
 
 /// The Namespace manifest.
 pub fn namespace() -> String {
@@ -536,6 +543,8 @@ mod tests {
         assert!(cfg.contains("hostPort: 19200"));
         assert!(cfg.contains("containerPort: 30920"));
         assert!(cfg.contains("kind: Cluster"));
+        // Pinned node image so the MA helm chart's k8s >=1.35.0 floor is met.
+        assert!(cfg.contains("image: kindest/node:v1.35.0"));
     }
 
     #[test]

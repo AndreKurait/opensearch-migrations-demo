@@ -165,6 +165,36 @@ impl TargetKind {
 /// The selectable target OpenSearch versions, newest first.
 pub const TARGET_VERSIONS: &[&str] = &["3.3.0", "3.1.0", "2.19.0"];
 
+/// How the harness hands the environment off to the Migration Assistant at the
+/// end of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaHandoff {
+    /// Install the Migration Assistant CLI from the fork release and launch it
+    /// (the CLI deploys MA to EKS — the production/cloud path).
+    InstallCli,
+    /// Deploy the Migration Assistant helm chart into a dedicated local KIND
+    /// cluster and `kubectl exec` into the migration-console — a fully-local,
+    /// no-AWS end-to-end migration. Only offered for local runs.
+    DeployLocalHelm,
+}
+
+impl MaHandoff {
+    pub fn id(self) -> &'static str {
+        match self {
+            MaHandoff::InstallCli => "install-cli",
+            MaHandoff::DeployLocalHelm => "deploy-local-helm",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            MaHandoff::InstallCli => "Install the Migration Assistant CLI (deploys to EKS/cloud)",
+            MaHandoff::DeployLocalHelm => {
+                "Deploy Migration Assistant locally to KIND (no AWS, full local migration)"
+            }
+        }
+    }
+}
+
 /// A client application to deploy against the source (generates load / traffic
 /// so the migration has something live to capture + replay).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +252,10 @@ pub struct Answers {
     pub clients_done: bool,
     /// Whether to pre-seed the source with sample documents before migrating.
     pub seed_data: Option<bool>,
+    /// How to hand off to the Migration Assistant at the end. `None` until asked;
+    /// only the local path offers the local-helm deploy.
+    #[serde(default)]
+    pub ma_handoff: Option<MaHandoff>,
 }
 
 impl Answers {
@@ -271,6 +305,18 @@ impl Answers {
     /// The AOSS collection name for the NextGen target (DNS-ish, ≤32 chars).
     pub fn aoss_collection_name(&self) -> String {
         format!("{}-target", Self::STACK)
+    }
+
+    /// The dedicated KIND cluster name that hosts the locally-deployed Migration
+    /// Assistant (when `ma_handoff` is `DeployLocalHelm`).
+    pub fn ma_cluster(&self) -> String {
+        format!("{}-ma", Self::STACK)
+    }
+
+    /// Whether the run deploys the Migration Assistant locally via helm (rather
+    /// than installing the EKS-targeting CLI).
+    pub fn deploys_ma_locally(&self) -> bool {
+        self.ma_handoff == Some(MaHandoff::DeployLocalHelm)
     }
 
     /// A one-line human summary of the plan, for the review screen + logs.
@@ -325,10 +371,22 @@ mod tests {
         a.target_version = Some("3.3.0".into());
         a.clients = vec![ClientApp::Locust, ClientApp::SampleSearchApp];
         a.seed_data = Some(true);
+        a.ma_handoff = Some(MaHandoff::DeployLocalHelm);
 
         let json = serde_json::to_string(&a).unwrap();
         let back: Answers = serde_json::from_str(&json).unwrap();
         assert_eq!(a, back);
+    }
+
+    #[test]
+    fn ma_handoff_drives_local_deploy_flag() {
+        let mut a = Answers::new();
+        assert!(!a.deploys_ma_locally());
+        a.ma_handoff = Some(MaHandoff::InstallCli);
+        assert!(!a.deploys_ma_locally());
+        a.ma_handoff = Some(MaHandoff::DeployLocalHelm);
+        assert!(a.deploys_ma_locally());
+        assert_eq!(a.ma_cluster(), "ma-demo-ma");
     }
 
     #[test]

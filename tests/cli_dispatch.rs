@@ -42,6 +42,8 @@ impl Script {
         );
         s.answers
             .insert(QuestionId::SeedData, Outcome::Answered(Answer::Bool(true)));
+        // Local run → also answer the MA-handoff choice (install the CLI here).
+        s.answers.insert(QuestionId::MaHandoff, ans("install-cli"));
         s
     }
 }
@@ -168,6 +170,9 @@ fn aoss_nextgen_target_provisions_via_aws_not_a_second_cluster() {
     );
     w.answers
         .insert(QuestionId::SeedData, Outcome::Answered(Answer::Bool(false)));
+    // Local run → the wizard asks the handoff; pick the CLI so this test stays
+    // focused on the AOSS target path.
+    w.answers.insert(QuestionId::MaHandoff, ans("install-cli"));
 
     let code = cli::dispatch(&args(&["run", "--workspace", ws.to_str().unwrap()]), &r, &w);
     assert_eq!(code, 0);
@@ -179,6 +184,35 @@ fn aoss_nextgen_target_provisions_via_aws_not_a_second_cluster() {
     assert!(r.any_call_contains("--generation NEXTGEN"));
     assert!(r.any_call_contains("create-collection"));
     std::env::remove_var("MA_DEMO_TEST");
+}
+
+#[test]
+fn local_helm_handoff_deploys_ma_to_kind_and_execs_console() {
+    let chart = tempfile::tempdir().unwrap();
+    std::env::set_var("MA_CHART_PATH", chart.path());
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let r = ready_runner().with_command("helm");
+    let w = Script::full_local();
+    // Non-interactive override → deploy MA locally via helm.
+    let code = cli::dispatch(
+        &args(&[
+            "-y",
+            "--ma-handoff",
+            "deploy-local-helm",
+            "--workspace",
+            ws.to_str().unwrap(),
+        ]),
+        &r,
+        &w,
+    );
+    assert_eq!(code, 0);
+    // A dedicated MA KIND cluster + helm install of the chart; no CLI download.
+    assert!(r.any_call_contains("kind create cluster --name ma-demo-ma"));
+    assert!(r.any_call_contains("upgrade --install --create-namespace"));
+    assert!(r.any_call_contains("opensearchstaging/opensearch-migrations-console"));
+    assert!(!r.any_call_contains("AndreKurait/opensearch-migrations"));
+    std::env::remove_var("MA_CHART_PATH");
 }
 
 #[test]
