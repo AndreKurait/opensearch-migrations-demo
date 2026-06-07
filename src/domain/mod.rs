@@ -3,6 +3,7 @@
 //! install + launch handoff). Each leaf module is re-exported at the crate
 //! root.
 
+pub mod aws;
 pub mod manifests;
 pub mod model;
 pub mod plan;

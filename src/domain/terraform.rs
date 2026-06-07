@@ -22,7 +22,8 @@ pub fn providers_tf(region: &str) -> String {
          \x20 required_providers {{\n\
          \x20   aws = {{\n\
          \x20     source  = \"hashicorp/aws\"\n\
-         \x20     version = \"~> 5.0\"\n\
+         \x20     # >= 6.x for aws_opensearchserverless_collection_group (NextGen).\n\
+         \x20     version = \"~> 6.0\"\n\
          \x20   }}\n\
          \x20 }}\n\
          }}\n\
@@ -175,6 +176,82 @@ pub fn target_domain_tf(version: &str) -> String {
     )
 }
 
+/// Target: an Amazon OpenSearch Serverless **NextGen** collection, modeled with
+/// first-class Terraform resources (no CLI shell-out). The collection group
+/// carries `generation = NEXTGEN` (which requires `standby_replicas = ENABLED`);
+/// the collection joins that group. Encryption + network + data-access policies
+/// are scoped to the collection. `principal` is the IAM ARN granted data-plane
+/// access (defaults to the caller via a data source).
+pub fn target_aoss_nextgen_tf() -> String {
+    // Plain string literal (not format!), so braces are literal — no doubling.
+    r#"# Target: an Amazon OpenSearch Serverless NextGen collection.
+# NextGen lives on the collection group (generation = NEXTGEN, which requires
+# standby_replicas = ENABLED); the collection joins that group. Requires the
+# hashicorp/aws provider >= 6.x (the collection_group resource).
+data "aws_caller_identity" "current" {}
+
+locals {
+  collection = "${var.prefix}-target"
+}
+
+resource "aws_opensearchserverless_collection_group" "target" {
+  name             = "cg-${local.collection}"
+  generation       = "NEXTGEN"
+  standby_replicas = "ENABLED"
+}
+
+resource "aws_opensearchserverless_security_policy" "enc" {
+  name = "${local.collection}-enc"
+  type = "encryption"
+  policy = jsonencode({
+    Rules       = [{ ResourceType = "collection", Resource = ["collection/${local.collection}"] }]
+    AWSOwnedKey = true
+  })
+}
+
+resource "aws_opensearchserverless_security_policy" "net" {
+  name = "${local.collection}-net"
+  type = "network"
+  policy = jsonencode([{
+    Rules = [
+      { ResourceType = "collection", Resource = ["collection/${local.collection}"] },
+      { ResourceType = "dashboard", Resource = ["collection/${local.collection}"] }
+    ]
+    AllowFromPublic = true
+  }])
+}
+
+resource "aws_opensearchserverless_access_policy" "data" {
+  name = "${local.collection}-data"
+  type = "data"
+  policy = jsonencode([{
+    Rules = [
+      { ResourceType = "collection", Resource = ["collection/${local.collection}"], Permission = ["aoss:*"] },
+      { ResourceType = "index", Resource = ["index/${local.collection}/*"], Permission = ["aoss:*"] }
+    ]
+    Principal = [data.aws_caller_identity.current.arn]
+  }])
+}
+
+resource "aws_opensearchserverless_collection" "target" {
+  name                  = local.collection
+  type                  = "SEARCH"
+  collection_group_name = aws_opensearchserverless_collection_group.target.name
+  standby_replicas      = "ENABLED"
+  depends_on = [
+    aws_opensearchserverless_security_policy.enc,
+    aws_opensearchserverless_security_policy.net,
+    aws_opensearchserverless_access_policy.data,
+  ]
+}
+
+output "target_endpoint" {
+  value = aws_opensearchserverless_collection.target.collection_endpoint
+}
+"#
+    .to_string()
+}
+
 /// One emitted terraform file: a relative path under the workspace + its body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TfFile {
@@ -209,7 +286,14 @@ pub fn files(answers: &Answers) -> Vec<TfFile> {
         });
     }
 
-    if answers.target_mode == Some(TargetMode::Provision) {
+    if answers.provisions_aoss_target() {
+        // AOSS NextGen collection — first-class Terraform resources.
+        out.push(TfFile {
+            path: "terraform/target.tf".into(),
+            body: target_aoss_nextgen_tf(),
+        });
+    } else if answers.target_mode == Some(TargetMode::Provision) {
+        // A managed Amazon OpenSearch Service domain.
         let tv = answers.target_version.as_deref().unwrap_or("3.3.0");
         let mm = major_minor(tv);
         out.push(TfFile {
@@ -322,6 +406,36 @@ mod tests {
         a.target_mode = Some(TargetMode::LeaveToMa);
         let paths: Vec<String> = files(&a).iter().map(|t| t.path.clone()).collect();
         assert!(!paths.contains(&"terraform/target.tf".to_string()));
+    }
+
+    #[test]
+    fn aoss_nextgen_target_emits_serverless_terraform() {
+        let mut a = cloud_answers();
+        a.target_kind = Some(crate::model::TargetKind::AossServerlessNextGen);
+        a.target_version = None;
+        let f = files(&a);
+        let target = f.iter().find(|t| t.path.ends_with("target.tf")).unwrap();
+        // First-class AOSS NextGen resources — no aws CLI shell-out, no domain.
+        assert!(target
+            .body
+            .contains("aws_opensearchserverless_collection_group"));
+        assert!(target.body.contains("generation       = \"NEXTGEN\""));
+        assert!(target.body.contains("standby_replicas = \"ENABLED\""));
+        assert!(target
+            .body
+            .contains("aws_opensearchserverless_collection\""));
+        assert!(target.body.contains("collection_group_name ="));
+        assert!(target
+            .body
+            .contains("aws_opensearchserverless_security_policy"));
+        assert!(target
+            .body
+            .contains("aws_opensearchserverless_access_policy"));
+        assert!(target.body.contains("collection_endpoint"));
+        assert!(!target.body.contains("aws_opensearch_domain"));
+        // Provider must be >= 6 for the collection_group resource.
+        let providers = f.iter().find(|t| t.path.ends_with("providers.tf")).unwrap();
+        assert!(providers.body.contains("~> 6.0"));
     }
 
     #[test]

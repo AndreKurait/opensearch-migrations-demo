@@ -206,8 +206,29 @@ fn plugin_command(engine: SourceEngine, plugins: &[String]) -> String {
 }
 
 /// A single-node Solr Deployment + Service for the source (backfill-only path).
-pub fn solr_source(version: &str) -> String {
+pub fn solr_source(version: &str, plugins: &[String]) -> String {
     let image = format!("solr:{version}");
+    // Solr 8.7+ enables contrib modules via the SOLR_MODULES env var. Map the
+    // chosen plugin ids to their contrib module names; non-module choices (dih /
+    // hdfs-repository configset conveniences) don't go through SOLR_MODULES.
+    let modules: Vec<&str> = plugins
+        .iter()
+        .filter_map(|p| match p.as_str() {
+            "s3-repository" => Some("s3-repository"),
+            "analysis-extras" => Some("analysis-extras"),
+            _ => None,
+        })
+        .collect();
+    let modules_env = if modules.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\x20         env:\n\
+             \x20           - name: SOLR_MODULES\n\
+             \x20             value: {}\n",
+            yaml_quote(&modules.join(","))
+        )
+    };
     format!(
         "apiVersion: v1\n\
          kind: Service\n\
@@ -244,6 +265,7 @@ pub fn solr_source(version: &str) -> String {
          \x20         image: {image}\n\
          \x20         ports:\n\
          \x20           - containerPort: 8983\n\
+         {modules_env}\
          \x20         args: [\"solr-precreate\", \"demo\"]\n"
     )
 }
@@ -251,9 +273,10 @@ pub fn solr_source(version: &str) -> String {
 /// Dispatch to the right source manifest for the chosen engine.
 pub fn source(answers: &Answers) -> String {
     match answers.source_engine {
-        Some(SourceEngine::Solr) => {
-            solr_source(answers.source_version.as_deref().unwrap_or("9.7.0"))
-        }
+        Some(SourceEngine::Solr) => solr_source(
+            answers.source_version.as_deref().unwrap_or("9.7.0"),
+            &answers.source_plugins,
+        ),
         Some(_) => http_source(answers),
         None => String::new(),
     }
@@ -620,10 +643,28 @@ mod tests {
 
     #[test]
     fn solr_source_uses_solr_image_and_precreate() {
-        let y = solr_source("9.7.0");
+        let y = solr_source("9.7.0", &[]);
         assert!(y.contains("image: solr:9.7.0"));
         assert!(y.contains("solr-precreate"));
         assert!(y.contains("nodePort: 30983"));
+        // No modules requested → no SOLR_MODULES env.
+        assert!(!y.contains("SOLR_MODULES"));
+    }
+
+    #[test]
+    fn solr_source_enables_contrib_modules_via_env() {
+        let y = solr_source(
+            "9.7.0",
+            &[
+                "s3-repository".to_string(),
+                "analysis-extras".to_string(),
+                "dih".to_string(),
+            ],
+        );
+        // s3-repository + analysis-extras are contrib modules → SOLR_MODULES;
+        // dih is a configset convenience, not a module.
+        assert!(y.contains("SOLR_MODULES"));
+        assert!(y.contains("s3-repository,analysis-extras"));
     }
 
     #[test]

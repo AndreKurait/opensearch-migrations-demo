@@ -52,10 +52,14 @@ Elm-architecture TUI whose rendered frames are asserted via `TestBackend`.
 ## Quick start
 
 ```sh
-# Build + run (needs docker, kind, kubectl, curl on PATH for the local path).
+# Install the latest release (macOS / Linux, x86_64 / aarch64):
+curl -fsSL https://github.com/AndreKurait/opensearch-migrations-demo/releases/latest/download/install.sh | bash
+ma-demo
+
+# …or from source (needs docker, kind, kubectl, curl on PATH for the local path):
 cargo run
 
-# Or non-interactively with sensible defaults (CI / unattended):
+# Non-interactively with sensible defaults (CI / unattended):
 cargo run -- --non-interactive
 
 # Just see the plan it would provision — touches nothing:

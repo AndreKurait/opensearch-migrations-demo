@@ -61,6 +61,13 @@ pub struct Flags {
     /// Skip auto-launching the live dashboard at the end of a run (provision +
     /// print only). For scripted/CI runs and tests.
     pub no_dashboard: bool,
+    /// On the cloud path, emit the Terraform but do NOT run `terraform apply`
+    /// (the operator applies it themselves).
+    pub no_apply: bool,
+    /// Override the AWS profile for cloud/AOSS operations.
+    pub aws_profile: Option<String>,
+    /// Override the AWS region for cloud/AOSS operations.
+    pub aws_region: Option<String>,
 }
 
 /// Parse flags out of the argument list (order-independent).
@@ -72,6 +79,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "-y" | "--non-interactive" | "--yes" => f.non_interactive = true,
             "--dry-run" | "--plan" => f.dry_run = true,
             "--no-dashboard" => f.no_dashboard = true,
+            "--no-apply" => f.no_apply = true,
             "--workspace" => {
                 f.workspace = args.get(i + 1).cloned();
                 i += 1;
@@ -80,11 +88,23 @@ pub fn parse_flags(args: &[String]) -> Flags {
                 f.ma_handoff = args.get(i + 1).cloned();
                 i += 1;
             }
+            "--aws-profile" => {
+                f.aws_profile = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--aws-region" => {
+                f.aws_region = args.get(i + 1).cloned();
+                i += 1;
+            }
             s => {
                 if let Some(v) = s.strip_prefix("--workspace=") {
                     f.workspace = Some(v.to_string());
                 } else if let Some(v) = s.strip_prefix("--ma-handoff=") {
                     f.ma_handoff = Some(v.to_string());
+                } else if let Some(v) = s.strip_prefix("--aws-profile=") {
+                    f.aws_profile = Some(v.to_string());
+                } else if let Some(v) = s.strip_prefix("--aws-region=") {
+                    f.aws_region = Some(v.to_string());
                 }
             }
         }
@@ -190,8 +210,40 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
             other => return Err(Error::die(format!("unknown --ma-handoff '{other}'"))),
         };
     }
+    // Explicit --aws-profile / --aws-region flags override the wizard/defaults.
+    if let Some(p) = flags.aws_profile.clone() {
+        answers.aws_profile = Some(p);
+    }
+    if let Some(r) = flags.aws_region.clone() {
+        answers.aws_region = Some(r);
+    }
     state.plan.answers = answers.clone();
     state.save()?;
+
+    // Surface the AWS identity the operator is about to deploy into, when the
+    // plan touches AWS — so they can confirm the profile/region/account.
+    if answers.touches_aws() {
+        crate::app::export_aws_env(&answers);
+        ui::dim(&format!(
+            "  AWS profile={} region={}",
+            answers.effective_aws_profile(),
+            answers.effective_aws_region()
+        ));
+        match crate::aws::caller_identity(
+            runner,
+            answers.effective_aws_profile(),
+            answers.effective_aws_region(),
+        ) {
+            Some(arn) => {
+                let acct = crate::aws::account_of(&arn).unwrap_or_else(|| "?".into());
+                ui::dim(&format!("  AWS identity: {arn}  (account {acct})"));
+            }
+            None => ui::warn(
+                "AWS credentials for that profile are missing or expired — \
+                 refresh them (e.g. `aws sso login` / `ada credentials update`) before applying.",
+            ),
+        }
+    }
 
     ui::step("Plan");
     print_plan(&answers);
@@ -201,12 +253,15 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
         return Ok(());
     }
 
-    // Provision through the orchestrator.
+    // Provision through the orchestrator. On the cloud path, apply Terraform
+    // for real unless --no-apply was passed (a non-interactive run also applies,
+    // so CI can stand infra up; pass --no-apply to emit-only).
     let progress = UiProgress;
     let mut app = App::new(runner, &workspace, &progress);
     app.state.plan.answers = answers.clone();
     app.preflight(&answers)?;
-    let plan = app.provision(&answers)?;
+    let apply_cloud = answers.target == Some(crate::model::Target::Cloud) && !flags.no_apply;
+    let plan = app.provision_with(&answers, apply_cloud)?;
     print_endpoints(&plan, &answers, app.state.plan.aoss_endpoint.as_deref());
 
     // Prepare the Migration Assistant handoff. Local-helm deploys MA into KIND
@@ -301,11 +356,18 @@ fn collect_answers<W: Wizardish>(
     }
 }
 
-/// The currently-selected ids to pre-check for a multi-choice question on
-/// resume (so re-entering the wizard keeps prior selections).
+/// The ids to pre-check for a multi-choice question. On resume we keep the
+/// prior selection; on first visit we seed the question's checked-by-default
+/// set (e.g. the snapshot-repository plugin).
 fn preselect_for(id: QuestionId, a: &Answers) -> Vec<String> {
     match id {
-        QuestionId::SourcePlugins => a.source_plugins.clone(),
+        QuestionId::SourcePlugins => {
+            if a.plugins_done {
+                a.source_plugins.clone()
+            } else {
+                wizard::default_checked(&wizard::build(QuestionId::SourcePlugins, a))
+            }
+        }
         QuestionId::Clients => a.clients.iter().map(|c| c.id().to_string()).collect(),
         _ => Vec::new(),
     }
@@ -525,7 +587,11 @@ Flags:\n\
 \x20 -y, --non-interactive      Accept defaults; for CI / unattended runs.\n\
 \x20 --dry-run, --plan          Stop after printing the plan.\n\
 \x20 --workspace DIR            Workspace dir (default ./migration-demo-workspace).\n\
-\x20 --ma-handoff KIND          MA handoff: deploy-local-helm | install-cli.\n\n\
+\x20 --ma-handoff KIND          MA handoff: deploy-local-helm | install-cli.\n\
+\x20 --no-dashboard             Don't auto-open the live status dashboard.\n\
+\x20 --no-apply                 Cloud path: emit Terraform but don't apply it.\n\
+\x20 --aws-profile NAME         AWS profile for cloud / AOSS operations.\n\
+\x20 --aws-region REGION        AWS region for cloud / AOSS operations.\n\n\
 This harness stands up a SOURCE search cluster (Elasticsearch / OpenSearch /\n\
 Solr), optional snapshot storage + target OpenSearch, and client apps, locally\n\
 via KIND or as Terraform for AWS — then installs and launches the Migration\n\
@@ -570,6 +636,8 @@ mod tests {
             QuestionId::TargetMode => "tmode",
             QuestionId::TargetKind => "tkind",
             QuestionId::TargetVersion => "tversion",
+            QuestionId::AwsProfile => "awsprofile",
+            QuestionId::AwsRegion => "awsregion",
             QuestionId::Clients => "clients",
             QuestionId::SeedData => "seed",
             QuestionId::MaHandoff => "handoff",

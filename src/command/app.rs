@@ -91,9 +91,21 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
     /// write the terraform files. Returns once the environment is provisioned
     /// (before the MA install/launch, which the dispatcher drives).
     pub fn provision(&mut self, answers: &Answers) -> Result<ProvisionPlan> {
+        self.provision_with(answers, false)
+    }
+
+    /// As [`provision`](Self::provision), but `apply_cloud` controls whether the
+    /// cloud (Terraform) path actually runs `terraform init && apply` after
+    /// emitting the files (vs just emitting them for the operator to apply).
+    pub fn provision_with(
+        &mut self,
+        answers: &Answers,
+        apply_cloud: bool,
+    ) -> Result<ProvisionPlan> {
+        export_aws_env(answers);
         let plan = plan::build(answers);
         if answers.target == Some(Target::Cloud) {
-            self.emit_terraform(answers)?;
+            self.emit_terraform(answers, apply_cloud)?;
             return Ok(plan);
         }
         self.run_actions(&plan)?;
@@ -355,14 +367,64 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
     }
 
     /// Write the cloud terraform files into the workspace.
-    fn emit_terraform(&mut self, answers: &Answers) -> Result<()> {
+    fn emit_terraform(&mut self, answers: &Answers, apply_cloud: bool) -> Result<()> {
         self.progress.step("Emitting Terraform (cloud)");
         for f in terraform::files(answers) {
             self.write_artifact(&f.path, &f.body)?;
             self.progress.info(&format!("wrote {}", f.path));
         }
+        let tf_dir = self.state.dir().join("terraform");
+        let tf_dir_str = tf_dir.to_string_lossy().to_string();
+
+        if !apply_cloud {
+            self.progress.info(&format!(
+                "emitted only — review then apply:  terraform -chdir={tf_dir_str} init && terraform -chdir={tf_dir_str} apply"
+            ));
+            return Ok(());
+        }
+
+        // Actually stand the cloud infra up. Requires terraform on PATH.
+        if !self.runner.has_command("terraform") {
+            return Err(Error::die(
+                "terraform not found on PATH; needed to apply the cloud deployment. \
+                 Install Terraform, or re-run with --no-apply to emit the files only.",
+            ));
+        }
+        self.progress.step("terraform init");
+        let init = self.runner.run(
+            "terraform",
+            &[&format!("-chdir={tf_dir_str}"), "init", "-input=false"],
+        );
+        if !init.success() {
+            return Err(Error::die(format!(
+                "terraform init failed: {}",
+                init.stderr.trim()
+            )));
+        }
         self.progress
-            .info("review the terraform/ files, then run `terraform init && terraform apply`");
+            .step("terraform apply (cloud — this provisions real AWS resources)");
+        let region = answers.effective_aws_region().to_string();
+        let apply = self.runner.run(
+            "terraform",
+            &[
+                &format!("-chdir={tf_dir_str}"),
+                "apply",
+                "-auto-approve",
+                "-input=false",
+                "-var",
+                &format!("region={region}"),
+            ],
+        );
+        if !apply.success() {
+            return Err(Error::die(format!(
+                "terraform apply failed: {}",
+                apply.stderr.trim()
+            )));
+        }
+        self.state.advance(Step::TargetUp);
+        self.state.save()?;
+        self.progress
+            .info("terraform apply complete; see outputs (source_endpoint / snapshot_bucket / target_endpoint).");
         Ok(())
     }
 
@@ -556,6 +618,19 @@ fn role_stem(role: ClusterRole) -> &'static str {
 pub fn ensure_workspace(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
     Ok(())
+}
+
+/// Export the chosen AWS profile + region into the process environment so every
+/// spawned `aws`/`terraform` command (and Terraform's AWS provider) uses them.
+/// No-op when the plan doesn't touch AWS. Called once before provisioning.
+pub fn export_aws_env(answers: &Answers) {
+    if !answers.touches_aws() {
+        return;
+    }
+    std::env::set_var("AWS_PROFILE", answers.effective_aws_profile());
+    std::env::set_var("AWS_REGION", answers.effective_aws_region());
+    // AWS_DEFAULT_REGION covers tools that read the older var name.
+    std::env::set_var("AWS_DEFAULT_REGION", answers.effective_aws_region());
 }
 
 #[cfg(test)]

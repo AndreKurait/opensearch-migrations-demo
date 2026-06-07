@@ -168,6 +168,9 @@ fn aoss_nextgen_target_provisions_via_aws_not_a_second_cluster() {
     w.answers.insert(QuestionId::TargetMode, ans("provision"));
     w.answers
         .insert(QuestionId::TargetKind, ans("aoss-nextgen"));
+    // AOSS touches AWS → the wizard asks for profile + region.
+    w.answers.insert(QuestionId::AwsProfile, ans("default"));
+    w.answers.insert(QuestionId::AwsRegion, ans("us-east-1"));
     w.answers.insert(
         QuestionId::Clients,
         Outcome::Answered(Answer::Choices(vec![])),

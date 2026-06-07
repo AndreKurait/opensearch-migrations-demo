@@ -2,6 +2,9 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# CI writes a cross-linker config here for the aarch64-linux build.
+/.cargo/config.toml
+
 # Generated provisioning workspace (the harness writes plans + manifests here).
 /migration-demo-workspace/
 

@@ -62,13 +62,21 @@ pub struct Screen {
 
 impl Screen {
     /// A fresh screen for `question`. For multi-choice, options whose ids are in
-    /// `preselect` start selected (resume-friendly).
+    /// `preselect` start selected (resume-friendly). When `preselect` is empty,
+    /// options marked `default_on` (e.g. the snapshot-repository plugin) start
+    /// checked instead.
     pub fn new(question: Question, preselect: &[String]) -> Self {
         let selected = match &question.kind {
             Kind::MultiChoice(choices) => choices
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| preselect.contains(&c.id))
+                .filter(|(_, c)| {
+                    if preselect.is_empty() {
+                        c.default_on
+                    } else {
+                        preselect.contains(&c.id)
+                    }
+                })
                 .map(|(i, _)| i)
                 .collect(),
             _ => Vec::new(),
@@ -205,7 +213,13 @@ impl Widget for &Screen {
 
         self.render_body(body_a, buf);
 
-        Paragraph::new(self.question.help.as_str().dim())
+        // Help area: the focused option's description when it has one (so each
+        // plugin/choice is explained as you move the cursor), else the
+        // question's general help.
+        let help_text = self
+            .focused_description()
+            .unwrap_or_else(|| self.question.help.clone());
+        Paragraph::new(help_text.dim())
             .wrap(Wrap { trim: true })
             .render(help_a, buf);
 
@@ -248,6 +262,16 @@ impl Screen {
                     .collect();
                 Paragraph::new(lines).render(area, buf);
             }
+        }
+    }
+
+    /// The description of the option under the cursor, if any.
+    fn focused_description(&self) -> Option<String> {
+        let c = self.choices().get(self.cursor)?;
+        if c.description.is_empty() {
+            None
+        } else {
+            Some(c.description.clone())
         }
     }
 
@@ -321,7 +345,9 @@ mod tests {
         let mut a = Answers::new();
         a.source_engine = Some(crate::model::SourceEngine::Elasticsearch);
         let q = wizard::build(QuestionId::SourcePlugins, &a);
-        Screen::new(q, &[])
+        // Seed an explicit (non-default) selection so these toggle-mechanics
+        // tests start from a known empty state, independent of default_on.
+        Screen::new(q, &["__none__".to_string()])
     }
     fn yesno() -> Screen {
         let q = wizard::build(QuestionId::SeedData, &Answers::new());

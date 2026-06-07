@@ -1,0 +1,109 @@
+# Cross-platform release: on a v* tag, build ma-demo for linux + macOS
+# (x86_64 + aarch64), tar each, and upload them + install.sh to the GitHub
+# release. The toolchain is pinned by rust-toolchain.toml.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build + attach assets to (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            linker: gcc-aarch64-linux-gnu
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "stripped=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cross-linker (linux aarch64)
+        if: matrix.linker != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.linker }}
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build
+        shell: bash
+        env:
+          DEMO_VERSION: ${{ steps.ver.outputs.stripped }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          bin="ma-demo-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/ma-demo" "$bin"
+          tarball="ma-demo-${{ steps.ver.outputs.stripped }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$tarball" "$bin"
+          shasum -a 256 "$tarball" > "$tarball.sha256" || sha256sum "$tarball" > "$tarball.sha256"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.tarball }}.sha256
+
+  installer:
+    name: attach install.sh
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload install.sh
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: install.sh

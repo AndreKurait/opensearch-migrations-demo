@@ -12,6 +12,7 @@
 //! turns key events into [`Answer`]s applied via [`apply`]; the non-interactive
 //! path fills answers from defaults the same way.
 
+use crate::aws;
 use crate::model::{
     Answers, ClientApp, MaHandoff, SnapshotStorage, SourceEngine, Target, TargetKind, TargetMode,
     TARGET_VERSIONS,
@@ -30,6 +31,9 @@ pub enum QuestionId {
     /// Which kind of target to provision (local KIND OpenSearch vs AOSS NextGen).
     TargetKind,
     TargetVersion,
+    /// AWS profile + region — only when the plan touches AWS (cloud or AOSS).
+    AwsProfile,
+    AwsRegion,
     Clients,
     SeedData,
     /// How to hand off to the Migration Assistant (local runs only).
@@ -49,11 +53,15 @@ pub enum Kind {
     YesNo,
 }
 
-/// One selectable option: a stable id and a human label.
+/// One selectable option: a stable id, a human label, an optional one-line
+/// `description` (shown under the option in the TUI), and `default_on` (for
+/// multi-choice questions, whether it starts checked).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
     pub id: String,
     pub label: String,
+    pub description: String,
+    pub default_on: bool,
 }
 
 impl Choice {
@@ -61,7 +69,33 @@ impl Choice {
         Self {
             id: id.into(),
             label: label.into(),
+            description: String::new(),
+            default_on: false,
         }
+    }
+
+    /// Add a one-line description shown under the option.
+    fn desc(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    /// Mark this option as checked-by-default (multi-choice only).
+    fn default_on(mut self) -> Self {
+        self.default_on = true;
+        self
+    }
+}
+
+/// The ids of a question's choices that are checked by default (multi-choice).
+pub fn default_checked(q: &Question) -> Vec<String> {
+    match &q.kind {
+        Kind::MultiChoice(cs) => cs
+            .iter()
+            .filter(|c| c.default_on)
+            .map(|c| c.id.clone())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -89,7 +123,7 @@ pub enum Answer {
 /// The ordered list of *candidate* questions. [`next_question`] walks this in
 /// order and returns the first whose answer is still missing AND that applies
 /// given the current answers.
-const FLOW: [QuestionId; 11] = [
+const FLOW: [QuestionId; 13] = [
     QuestionId::Target,
     QuestionId::SourceEngine,
     QuestionId::SourceVersion,
@@ -98,6 +132,8 @@ const FLOW: [QuestionId; 11] = [
     QuestionId::TargetMode,
     QuestionId::TargetKind,
     QuestionId::TargetVersion,
+    QuestionId::AwsProfile,
+    QuestionId::AwsRegion,
     QuestionId::Clients,
     QuestionId::SeedData,
     QuestionId::MaHandoff,
@@ -113,6 +149,9 @@ fn applies(q: QuestionId, a: &Answers) -> bool {
         // OpenSearch target — an AOSS NextGen collection takes no version, and
         // leaving the target to MA needs no version either.
         QuestionId::TargetVersion => a.provisions_local_target(),
+        // AWS profile + region only when the plan touches AWS (cloud target or
+        // an AOSS NextGen target).
+        QuestionId::AwsProfile | QuestionId::AwsRegion => a.touches_aws(),
         // The MA-handoff choice (CLI vs local helm deploy) is only meaningful
         // for local runs; cloud always installs the EKS-targeting CLI.
         QuestionId::MaHandoff => a.target == Some(Target::Local),
@@ -135,6 +174,8 @@ fn answered(q: QuestionId, a: &Answers) -> bool {
         QuestionId::TargetMode => a.target_mode.is_some(),
         QuestionId::TargetKind => a.target_kind.is_some(),
         QuestionId::TargetVersion => a.target_version.is_some(),
+        QuestionId::AwsProfile => a.aws_profile.is_some(),
+        QuestionId::AwsRegion => a.aws_region.is_some(),
         QuestionId::Clients => a.clients_done,
         QuestionId::SeedData => a.seed_data.is_some(),
         QuestionId::MaHandoff => a.ma_handoff.is_some(),
@@ -198,11 +239,12 @@ pub fn build(id: QuestionId, a: &Answers) -> Question {
         }
         QuestionId::SourcePlugins => {
             let eng = a.source_engine.unwrap_or(SourceEngine::Elasticsearch);
+            let ver = a.source_version.as_deref().unwrap_or("");
             Question {
                 id,
                 title: format!("Which plugins should the {} source load?", eng.label()),
-                help: "Optional. repository-s3 is needed for snapshot backfill on Elasticsearch < 7.x; analysis plugins exercise mapping migration.".into(),
-                kind: Kind::MultiChoice(plugin_choices(eng)),
+                help: "Pre-checked items install by default (Space toggles, Enter confirms). The snapshot-repository plugin is the migration's backfill source — keep it unless you have a reason not to.".into(),
+                kind: Kind::MultiChoice(plugin_choices(eng, ver)),
             }
         }
         QuestionId::SnapshotStorage => Question {
@@ -247,6 +289,28 @@ pub fn build(id: QuestionId, a: &Answers) -> Question {
                 TARGET_VERSIONS.iter().map(|v| Choice::new(*v, *v)).collect(),
             ),
         },
+        QuestionId::AwsProfile => Question {
+            id,
+            title: "Which AWS profile should the cloud / AOSS operations use?".into(),
+            help: "Profiles discovered from ~/.aws/config + ~/.aws/credentials. The harness exports AWS_PROFILE for every aws/terraform call.".into(),
+            kind: Kind::SingleChoice(
+                aws::list_profiles()
+                    .iter()
+                    .map(|p| Choice::new(p.clone(), p.clone()))
+                    .collect(),
+            ),
+        },
+        QuestionId::AwsRegion => Question {
+            id,
+            title: "Which AWS region?".into(),
+            help: "The region for the cloud deployment / AOSS collection. The harness exports AWS_REGION for every aws/terraform call.".into(),
+            kind: Kind::SingleChoice(
+                aws::COMMON_REGIONS
+                    .iter()
+                    .map(|r| Choice::new(*r, *r))
+                    .collect(),
+            ),
+        },
         QuestionId::Clients => Question {
             id,
             title: "Which client applications should drive load against the source?".into(),
@@ -283,26 +347,75 @@ pub fn build(id: QuestionId, a: &Answers) -> Question {
 }
 
 /// The plugin options offered for a source engine.
-fn plugin_choices(eng: SourceEngine) -> Vec<Choice> {
+fn plugin_choices(eng: SourceEngine, version: &str) -> Vec<Choice> {
     match eng {
+        // ES/OpenSearch bundle repository-s3 in the same distribution; it's the
+        // snapshot backend the migration backfills from, so default it on.
         SourceEngine::Elasticsearch => vec![
-            Choice::new("repository-s3", "repository-s3 (S3 snapshot repo)"),
-            Choice::new("analysis-icu", "analysis-icu (ICU analyzer)"),
-            Choice::new("analysis-phonetic", "analysis-phonetic"),
-            Choice::new("mapper-size", "mapper-size"),
+            Choice::new("repository-s3", "repository-s3")
+                .desc("S3 snapshot repository — the backfill source-of-truth for the migration.")
+                .default_on(),
+            Choice::new("analysis-icu", "analysis-icu").desc(
+                "ICU Unicode analysis (folding/collation) — exercises analyzer mapping migration.",
+            ),
+            Choice::new("analysis-phonetic", "analysis-phonetic")
+                .desc("Phonetic token filters (soundex, metaphone) for fuzzy name search."),
+            Choice::new("mapper-size", "mapper-size")
+                .desc("Records each document's _size in bytes as a mapped field."),
         ],
         SourceEngine::OpenSearch => vec![
-            Choice::new("repository-s3", "repository-s3 (S3 snapshot repo)"),
-            Choice::new("analysis-icu", "analysis-icu (ICU analyzer)"),
-            Choice::new("analysis-phonetic", "analysis-phonetic"),
+            Choice::new("repository-s3", "repository-s3")
+                .desc("S3 snapshot repository — the backfill source-of-truth for the migration.")
+                .default_on(),
+            Choice::new("analysis-icu", "analysis-icu").desc(
+                "ICU Unicode analysis (folding/collation) — exercises analyzer mapping migration.",
+            ),
+            Choice::new("analysis-phonetic", "analysis-phonetic")
+                .desc("Phonetic token filters (soundex, metaphone) for fuzzy name search."),
         ],
-        // Solr "plugins" here are configset/handler conveniences; keep a small,
-        // representative set so the multi-choice screen is non-empty.
-        SourceEngine::Solr => vec![
-            Choice::new("dih", "DataImportHandler configset"),
-            Choice::new("schema-api", "Managed schema API"),
-        ],
+        SourceEngine::Solr => solr_plugin_choices(version),
     }
+}
+
+/// Solr "plugins" are contrib modules + configset conveniences. The S3 backup
+/// repository (`org.apache.solr.s3.S3BackupRepository`) is a **contrib module
+/// added in Solr 8.7+** — it does NOT exist in Solr 6/7 (those back up to HDFS
+/// or the local filesystem). So we offer the S3 repo (default-checked) only on
+/// 8.7+, and offer the HDFS backup repo on 6/7 instead.
+fn solr_plugin_choices(version: &str) -> Vec<Choice> {
+    let s3_supported = solr_at_least(version, 8, 7);
+    let mut out = Vec::new();
+    if s3_supported {
+        out.push(
+            Choice::new("s3-repository", "s3-repository (contrib)")
+                .desc("S3 backup repository (org.apache.solr.s3.S3BackupRepository; dist/solr-s3-repository-*.jar + contrib/s3-repository/lib, ≥8.7) — enabled via SOLR_MODULES.")
+                .default_on(),
+        );
+    } else {
+        out.push(
+            Choice::new("hdfs-repository", "hdfs-repository")
+                .desc("HDFS backup repository — Solr 6/7 have no S3 backup repo (S3 is a contrib module from 8.7+).")
+                .default_on(),
+        );
+    }
+    out.push(
+        Choice::new("dih", "DataImportHandler")
+            .desc("DataImportHandler configset for importing from a DB/XML into a Solr core."),
+    );
+    out.push(
+        Choice::new("analysis-extras", "analysis-extras (contrib)")
+            .desc("Extra analyzers/tokenizers (ICU, Smart Chinese, Polish, Morfologik)."),
+    );
+    out
+}
+
+/// Whether a Solr version string is >= major.minor (e.g. 8.7). Parses the
+/// leading `MAJOR.MINOR`; unknown/garbage sorts as 0.0 (so "not at least").
+fn solr_at_least(version: &str, major: u32, minor: u32) -> bool {
+    let mut it = version.split('.');
+    let vmaj = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let vmin = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    (vmaj, vmin) >= (major, minor)
 }
 
 /// Apply a typed [`Answer`] for `id` into `Answers`. Returns the next question
@@ -357,6 +470,12 @@ pub fn apply(a: &mut Answers, id: QuestionId, ans: Answer) -> QuestionId {
         (QuestionId::Clients, Answer::Choices(cs)) => {
             a.clients = cs.iter().filter_map(|c| parse_client(c)).collect();
             a.clients_done = true;
+        }
+        (QuestionId::AwsProfile, Answer::Choice(c)) => {
+            a.aws_profile = Some(c);
+        }
+        (QuestionId::AwsRegion, Answer::Choice(c)) => {
+            a.aws_region = Some(c);
         }
         (QuestionId::SeedData, Answer::Bool(b)) => {
             a.seed_data = Some(b);
@@ -451,6 +570,15 @@ pub fn fill_defaults(a: &mut Answers) {
     if a.provisions_local_target() && a.target_version.is_none() {
         a.target_version = Some(TARGET_VERSIONS[0].to_string());
     }
+    // AWS profile + region default only when the plan touches AWS.
+    if a.touches_aws() {
+        if a.aws_profile.is_none() {
+            a.aws_profile = Some("default".to_string());
+        }
+        if a.aws_region.is_none() {
+            a.aws_region = Some(aws::COMMON_REGIONS[0].to_string());
+        }
+    }
     if a.seed_data.is_none() {
         a.seed_data = Some(true);
     }
@@ -469,8 +597,15 @@ pub fn fill_defaults(a: &mut Answers) {
             MaHandoff::InstallCli
         });
     }
-    // Plugins default to empty but the question counts as answered.
-    a.plugins_done = true;
+    // Source plugins default to the checked-by-default set (e.g. the snapshot
+    // repository) unless the question was already answered.
+    if !a.plugins_done {
+        if a.source_plugins.is_empty() {
+            let q = build(QuestionId::SourcePlugins, a);
+            a.source_plugins = default_checked(&q);
+        }
+        a.plugins_done = true;
+    }
 }
 
 #[cfg(test)]
@@ -637,16 +772,37 @@ mod tests {
             ),
             QuestionId::TargetKind
         );
-        // Choosing AOSS NextGen must skip the OpenSearch-version question.
+        // Choosing AOSS NextGen skips the OpenSearch-version question but, since
+        // it touches AWS, next asks for the AWS profile (then region).
         let next = apply(
             &mut a,
             QuestionId::TargetKind,
             Answer::Choice("aoss-nextgen".into()),
         );
-        assert_eq!(next, QuestionId::Clients);
+        assert_eq!(next, QuestionId::AwsProfile);
         assert!(a.target_version.is_none());
         assert!(a.provisions_aoss_target());
         assert!(!a.provisions_local_target());
+        assert!(a.touches_aws());
+        // Profile → region → then Clients.
+        assert_eq!(
+            apply(
+                &mut a,
+                QuestionId::AwsProfile,
+                Answer::Choice("default".into())
+            ),
+            QuestionId::AwsRegion
+        );
+        assert_eq!(
+            apply(
+                &mut a,
+                QuestionId::AwsRegion,
+                Answer::Choice("us-east-1".into())
+            ),
+            QuestionId::Clients
+        );
+        assert_eq!(a.effective_aws_profile(), "default");
+        assert_eq!(a.effective_aws_region(), "us-east-1");
     }
 
     #[test]
@@ -688,6 +844,9 @@ mod tests {
             Kind::SingleChoice(opts) => {
                 let ids: Vec<&str> = opts.iter().map(|c| c.id.as_str()).collect();
                 assert!(ids.contains(&"9.7.0"));
+                // Solr 6/7 line tips are offered.
+                assert!(ids.contains(&"7.7.3"));
+                assert!(ids.contains(&"6.6.6"));
                 assert!(
                     !ids.contains(&"7.10.2"),
                     "ES versions must not leak into Solr"
@@ -695,6 +854,89 @@ mod tests {
             }
             _ => panic!("expected single choice"),
         }
+    }
+
+    #[test]
+    fn solr_s3_repo_plugin_only_on_8_7_plus() {
+        // Solr 9.7 + 8.11 → S3 repo contrib, default-checked.
+        for v in ["9.7.0", "8.11.3"] {
+            let mut a = Answers::new();
+            a.source_engine = Some(SourceEngine::Solr);
+            a.source_version = Some(v.into());
+            let q = build(QuestionId::SourcePlugins, &a);
+            let ids: Vec<String> = match &q.kind {
+                Kind::MultiChoice(cs) => cs.iter().map(|c| c.id.clone()).collect(),
+                _ => panic!(),
+            };
+            assert!(
+                ids.contains(&"s3-repository".to_string()),
+                "{v} should offer S3 repo"
+            );
+            assert!(default_checked(&q).contains(&"s3-repository".to_string()));
+        }
+        // Solr 7.7 + 6.6 → NO S3 repo (contrib module is 8.7+); HDFS instead.
+        for v in ["7.7.3", "6.6.6"] {
+            let mut a = Answers::new();
+            a.source_engine = Some(SourceEngine::Solr);
+            a.source_version = Some(v.into());
+            let q = build(QuestionId::SourcePlugins, &a);
+            let ids: Vec<String> = match &q.kind {
+                Kind::MultiChoice(cs) => cs.iter().map(|c| c.id.clone()).collect(),
+                _ => panic!(),
+            };
+            assert!(
+                !ids.contains(&"s3-repository".to_string()),
+                "{v} must NOT offer S3 repo"
+            );
+            assert!(
+                ids.contains(&"hdfs-repository".to_string()),
+                "{v} should offer HDFS repo"
+            );
+        }
+    }
+
+    #[test]
+    fn every_plugin_choice_has_a_description() {
+        for (eng, ver) in [
+            (SourceEngine::Elasticsearch, "7.10.2"),
+            (SourceEngine::OpenSearch, "2.15.0"),
+            (SourceEngine::Solr, "9.7.0"),
+            (SourceEngine::Solr, "7.7.3"),
+        ] {
+            let mut a = Answers::new();
+            a.source_engine = Some(eng);
+            a.source_version = Some(ver.into());
+            let q = build(QuestionId::SourcePlugins, &a);
+            if let Kind::MultiChoice(cs) = &q.kind {
+                for c in cs {
+                    assert!(
+                        !c.description.is_empty(),
+                        "{} {ver} plugin {} has no description",
+                        eng.id(),
+                        c.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn es_repository_s3_is_default_checked() {
+        let mut a = Answers::new();
+        a.source_engine = Some(SourceEngine::Elasticsearch);
+        a.source_version = Some("7.10.2".into());
+        let q = build(QuestionId::SourcePlugins, &a);
+        assert!(default_checked(&q).contains(&"repository-s3".to_string()));
+    }
+
+    #[test]
+    fn solr_at_least_compares_major_minor() {
+        assert!(solr_at_least("8.7.0", 8, 7));
+        assert!(solr_at_least("9.7.0", 8, 7));
+        assert!(solr_at_least("8.11.3", 8, 7));
+        assert!(!solr_at_least("8.6.3", 8, 7));
+        assert!(!solr_at_least("7.7.3", 8, 7));
+        assert!(!solr_at_least("6.6.6", 8, 7));
     }
 
     #[test]

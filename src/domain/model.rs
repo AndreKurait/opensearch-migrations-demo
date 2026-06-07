@@ -66,8 +66,11 @@ impl SourceEngine {
             SourceEngine::Elasticsearch => &["8.17.0", "7.17.22", "7.10.2", "6.8.23", "5.6.16"],
             // OS source images on docker hub / public.ecr.aws.
             SourceEngine::OpenSearch => &["2.19.0", "2.15.0", "1.3.20"],
-            // Solr is backfill-only; 8 and 9 are the dev-sandbox versions.
-            SourceEngine::Solr => &["9.7.0", "8.11.3"],
+            // Solr is backfill-only. Latest of each supported major: 9.7,
+            // 8.11, and the 7.x / 6.x line tips (7.7.3 / 6.6.6). Note the S3
+            // backup repository is a contrib module only from 8.7+ (see
+            // `plugin_options`), so 6/7 back up to HDFS/local instead.
+            SourceEngine::Solr => &["9.7.0", "8.11.3", "7.7.3", "6.6.6"],
         }
     }
 
@@ -256,6 +259,13 @@ pub struct Answers {
     /// only the local path offers the local-helm deploy.
     #[serde(default)]
     pub ma_handoff: Option<MaHandoff>,
+    /// The AWS profile to use for cloud / AOSS operations (`None` → "default").
+    /// Only asked when the plan touches AWS.
+    #[serde(default)]
+    pub aws_profile: Option<String>,
+    /// The AWS region for cloud / AOSS operations (`None` → "us-east-1").
+    #[serde(default)]
+    pub aws_region: Option<String>,
 }
 
 impl Answers {
@@ -317,6 +327,22 @@ impl Answers {
     /// than installing the EKS-targeting CLI).
     pub fn deploys_ma_locally(&self) -> bool {
         self.ma_handoff == Some(MaHandoff::DeployLocalHelm)
+    }
+
+    /// Whether this plan touches AWS at all — a Cloud target, or an AOSS
+    /// NextGen target. Drives whether the wizard asks for an AWS profile/region.
+    pub fn touches_aws(&self) -> bool {
+        self.target == Some(Target::Cloud) || self.provisions_aoss_target()
+    }
+
+    /// The effective AWS profile (chosen, else "default").
+    pub fn effective_aws_profile(&self) -> &str {
+        self.aws_profile.as_deref().unwrap_or("default")
+    }
+
+    /// The effective AWS region (chosen, else "us-east-1").
+    pub fn effective_aws_region(&self) -> &str {
+        self.aws_region.as_deref().unwrap_or("us-east-1")
     }
 
     /// A one-line human summary of the plan, for the review screen + logs.
