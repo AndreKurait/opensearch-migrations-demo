@@ -11,6 +11,16 @@ then hands you off to the Migration Assistant CLI to run the actual migration.
 > snapshot storage, target kind, client apps, sample-data seeding, and the
 > Migration Assistant handoff — then prints the plan it would provision.
 
+After provisioning, the harness streams each step live and then drops into a
+**real-time status dashboard** that re-probes the actual resources every 2s and
+stays up until you quit (or open it any time with `ma-demo status`):
+
+![ma-demo live status dashboard](docs/dashboard.gif)
+
+> Recorded against a live environment — cluster health, source workloads,
+> per-index document counts, the target, and the Migration Assistant all update
+> in place as the dashboard re-probes.
+
 It asks you a short series of questions — *local or cloud? which source engine
 and version? which plugins? snapshot storage? a target cluster? which client
 apps?* — and from your answers it provisions everything, end to end:
@@ -179,16 +189,18 @@ src/
   command/   app (provisioning orchestrator) · cli (dispatcher)
 tests/       provision_pipeline · cli_dispatch · manifests_and_terraform
 terraform/   standalone AWS examples (aws-source / aws-target)
-docs/        demo.tape (VHS script) · demo.gif (the README recording)
+docs/        demo.tape / demo.gif (wizard) · dashboard.tape / dashboard.gif (live status)
 ```
 
-### Regenerating the demo GIF
+### Regenerating the GIFs
 
-The README recording is scripted with [VHS](https://github.com/charmbracelet/vhs):
+The recordings are scripted with [VHS](https://github.com/charmbracelet/vhs):
 
 ```sh
-cargo build --release          # docs/demo.tape drives ./target/release/ma-demo
-vhs docs/demo.tape             # → docs/demo.gif
+cargo build --release          # both tapes drive ./target/release/ma-demo
+vhs docs/demo.tape             # → docs/demo.gif (the wizard, plan mode)
+# dashboard.gif needs a running env first (ma-demo run), then:
+vhs docs/dashboard.tape        # → docs/dashboard.gif (the live status dashboard)
 ```
 
 ## License

@@ -118,17 +118,21 @@ fn plan_subcommand_collects_but_provisions_nothing() {
 
 #[test]
 fn full_run_provisions_and_installs_ma() {
+    // --no-dashboard skips the live dashboard auto-launch (needs a TTY) so this
+    // interactive run can assert the provisioning + MA-install steps.
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("ws");
     let r = ready_runner();
     let w = Script::full_local();
-    let code = cli::dispatch(&args(&["run", "--workspace", ws.to_str().unwrap()]), &r, &w);
+    let code = cli::dispatch(
+        &args(&["run", "--no-dashboard", "--workspace", ws.to_str().unwrap()]),
+        &r,
+        &w,
+    );
     assert_eq!(code, 0);
     assert!(r.any_call_contains("kind create cluster --name ma-demo-source"));
     assert!(r.any_call_contains("kind create cluster --name ma-demo-target"));
     assert!(r.any_call_contains("AndreKurait/opensearch-migrations"));
-    // Interactive run (no -y) execs the MA binary through the runner.
-    assert!(r.any_call_contains("/migration-assistant"));
 }
 
 #[test]
@@ -174,7 +178,11 @@ fn aoss_nextgen_target_provisions_via_aws_not_a_second_cluster() {
     // focused on the AOSS target path.
     w.answers.insert(QuestionId::MaHandoff, ans("install-cli"));
 
-    let code = cli::dispatch(&args(&["run", "--workspace", ws.to_str().unwrap()]), &r, &w);
+    let code = cli::dispatch(
+        &args(&["run", "--no-dashboard", "--workspace", ws.to_str().unwrap()]),
+        &r,
+        &w,
+    );
     assert_eq!(code, 0);
     // Source KIND cluster yes; NO target KIND cluster.
     assert!(r.any_call_contains("kind create cluster --name ma-demo-source"));
@@ -213,6 +221,22 @@ fn local_helm_handoff_deploys_ma_to_kind_and_execs_console() {
     assert!(r.any_call_contains("opensearchstaging/opensearch-migrations-console"));
     assert!(!r.any_call_contains("AndreKurait/opensearch-migrations"));
     std::env::remove_var("MA_CHART_PATH");
+}
+
+#[test]
+fn status_without_a_saved_plan_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let r = ready_runner();
+    let w = Script::new();
+    // No saved plan in this fresh workspace → status should error cleanly
+    // rather than open a dashboard with nothing to show.
+    let code = cli::dispatch(
+        &args(&["status", "--workspace", ws.to_str().unwrap()]),
+        &r,
+        &w,
+    );
+    assert_eq!(code, 1);
 }
 
 #[test]

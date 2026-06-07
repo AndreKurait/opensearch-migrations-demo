@@ -32,6 +32,6 @@ pub mod command;
 // Flat re-exports — the public path is `ma_demo::<module>` regardless of folder.
 pub use core::{error, runner, state, util};
 pub use domain::{manifests, model, plan, terraform, wizard};
-pub use view::{progress, tui, ui};
+pub use view::{dashboard, progress, tui, ui};
 
 pub use command::{app, cli};

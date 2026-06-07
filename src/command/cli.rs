@@ -14,7 +14,7 @@ use crate::runner::CommandRunner;
 use crate::state::State;
 use crate::tui::Outcome;
 use crate::wizard::{self, QuestionId};
-use crate::{terraform, ui};
+use crate::{dashboard, terraform, ui};
 use std::path::PathBuf;
 
 /// The harness version, stamped from build.rs (CLI_VERSION) or a dev default.
@@ -58,6 +58,9 @@ pub struct Flags {
     pub workspace: Option<String>,
     /// Overrides the MA handoff: "install-cli" or "deploy-local-helm".
     pub ma_handoff: Option<String>,
+    /// Skip auto-launching the live dashboard at the end of a run (provision +
+    /// print only). For scripted/CI runs and tests.
+    pub no_dashboard: bool,
 }
 
 /// Parse flags out of the argument list (order-independent).
@@ -68,6 +71,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         match args[i].as_str() {
             "-y" | "--non-interactive" | "--yes" => f.non_interactive = true,
             "--dry-run" | "--plan" => f.dry_run = true,
+            "--no-dashboard" => f.no_dashboard = true,
             "--workspace" => {
                 f.workspace = args.get(i + 1).cloned();
                 i += 1;
@@ -118,6 +122,7 @@ fn run<R: CommandRunner, W: Wizardish>(args: &[String], runner: &R, wiz: &W) -> 
         Some("plan") => cmd_run(runner, wiz, &rest, true),
         Some("clear") => cmd_clear(&rest),
         Some("destroy") => cmd_destroy(runner, &rest),
+        Some("status") => cmd_status(runner, &rest),
         Some("version") | Some("--version") | Some("-V") => {
             println!("{VERSION}");
             Ok(())
@@ -204,16 +209,66 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
     let plan = app.provision(&answers)?;
     print_endpoints(&plan, &answers, app.state.plan.aoss_endpoint.as_deref());
 
-    // Hand off to the Migration Assistant. Local-helm deploys MA into KIND and
-    // execs the console; otherwise install the EKS-targeting CLI and launch it.
+    // Prepare the Migration Assistant handoff. Local-helm deploys MA into KIND
+    // (returns the console-exec argv); otherwise install the EKS-targeting CLI
+    // (returns the launch argv). Both stream their own steps.
     let argv = if answers.deploys_ma_locally() {
         app.deploy_ma_local()?
     } else {
         app.install_ma()?
     };
-    ui::ok("Environment ready. Launching the Migration Assistant…");
-    ui::dim(&format!("  $ {}", argv.join(" ")));
-    launch_ma(runner, &argv, flags.non_interactive)
+    ui::ok("Environment ready.");
+
+    // The persistent end state: a live, auto-refreshing dashboard of everything
+    // provisioned. It stays up until the operator quits (q/Esc). The MA launch
+    // command is printed so they can start the migration when ready. In a
+    // non-interactive run there's no TTY, so we skip the dashboard and just
+    // print the next-step command.
+    // Skip the dashboard when there's no usable TTY: non-interactive runs or an
+    // explicit --no-dashboard (scripted/CI/tests).
+    if flags.non_interactive || flags.no_dashboard {
+        ui::dim("  skipping live dashboard; run `ma-demo status` to open it later.");
+        ui::info(&format!(
+            "  Launch the Migration Assistant with:  {}",
+            argv.join(" ")
+        ));
+        ui::dim("  See live status any time with:  ma-demo status");
+        return Ok(());
+    }
+    ui::info(&format!(
+        "  When ready, launch the Migration Assistant:  {}",
+        argv.join(" ")
+    ));
+    ui::dim("  Opening the live status dashboard… (press q to exit, then run the command above)");
+    dashboard::run_live(runner, &answers, std::time::Duration::from_secs(2))?;
+    ui::ok("Dashboard closed. Your environment is still running.");
+    ui::info(&format!("  Migration Assistant:  {}", argv.join(" ")));
+    ui::dim("  Tear it all down with:  ma-demo destroy");
+    Ok(())
+}
+
+/// `status` — open the live dashboard for an existing environment (re-probes the
+/// real resources every 2s, stays up until q/Esc). Reads the saved plan to know
+/// what to probe.
+fn cmd_status<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
+    let flags = parse_flags(args);
+    let workspace = flags
+        .workspace
+        .map(PathBuf::from)
+        .unwrap_or_else(default_workspace);
+    let mut state = State::new(&workspace);
+    state.load()?;
+    if state.plan.answers.target.is_none() {
+        return Err(Error::die(
+            "no saved plan found — run `ma-demo run` first (or pass --workspace <dir>).",
+        ));
+    }
+    dashboard::run_live(
+        runner,
+        &state.plan.answers,
+        std::time::Duration::from_secs(2),
+    )?;
+    Ok(())
 }
 
 /// Drive the wizard until [`QuestionId::Review`], applying each answer. On
@@ -253,29 +308,6 @@ fn preselect_for(id: QuestionId, a: &Answers) -> Vec<String> {
         QuestionId::SourcePlugins => a.source_plugins.clone(),
         QuestionId::Clients => a.clients.iter().map(|c| c.id().to_string()).collect(),
         _ => Vec::new(),
-    }
-}
-
-/// Exec (or, non-interactively, just report) the Migration Assistant launch.
-/// In an interactive terminal the harness replaces itself with the MA CLI; in
-/// non-interactive/CI we don't exec (no TTY) and just confirm readiness.
-fn launch_ma<R: CommandRunner>(runner: &R, argv: &[String], non_interactive: bool) -> Result<()> {
-    if non_interactive {
-        ui::dim("  non-interactive: not launching the TUI; run the command above to start.");
-        return Ok(());
-    }
-    // Run the MA CLI through the seam. RealRunner spawns it inheriting the
-    // terminal; the harness returns its exit status as success/failure.
-    let prog = &argv[0];
-    let rest: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-    let out = runner.run(prog, &rest);
-    if out.success() {
-        Ok(())
-    } else {
-        Err(Error::with_code(
-            "Migration Assistant exited non-zero",
-            out.status.max(1),
-        ))
     }
 }
 
@@ -485,6 +517,7 @@ Usage:\n\
 \x20 ma-demo run [flags]        Same as default\n\
 \x20 ma-demo plan [flags]       Collect answers + print the plan; provision nothing\n\
 \x20 ma-demo clear [flags]      Wipe the local workspace (no Docker/cloud changes)\n\
+\x20 ma-demo status [flags]     Live, auto-refreshing dashboard of the environment\n\
 \x20 ma-demo destroy [flags]    Delete the local KIND clusters + wipe the workspace\n\
 \x20 ma-demo version            Print version\n\
 \x20 ma-demo help               This help\n\n\
