@@ -144,22 +144,26 @@ pub fn build(answers: &Answers) -> ProvisionPlan {
         what: "source cluster".into(),
     });
 
-    // ---- client apps (against the source) ----
-    for (name, body) in manifests::client_manifests(answers, &source_host) {
-        actions.push(Action::ApplyManifest {
-            role: ClusterRole::Source,
-            name: name.into(),
-            body,
-        });
-    }
-
-    // ---- sample data seed (against the source) ----
-    if answers.seed_data == Some(true) {
-        actions.push(Action::ApplyManifest {
-            role: ClusterRole::Source,
-            name: "data-seed".into(),
-            body: manifests::data_seed_job(&source_host),
-        });
+    // ---- client apps + sample data (against the source) ----
+    // Both the Locust/sample-app clients and the seed Job speak the OpenSearch/
+    // Elasticsearch HTTP API (`:9200`, `_bulk`), so they only apply to an HTTP
+    // source. A Solr source (`:8983`) has no equivalent here — skip them rather
+    // than emit manifests that can't work.
+    if answers.source_is_http() {
+        for (name, body) in manifests::client_manifests(answers, &source_host) {
+            actions.push(Action::ApplyManifest {
+                role: ClusterRole::Source,
+                name: name.into(),
+                body,
+            });
+        }
+        if answers.seed_data == Some(true) {
+            actions.push(Action::ApplyManifest {
+                role: ClusterRole::Source,
+                name: "data-seed".into(),
+                body: manifests::data_seed_job(&source_host),
+            });
+        }
     }
 
     // ---- target (optional) — kind depends on the chosen target_kind ----
@@ -391,6 +395,33 @@ pub fn aoss_delete_access_policy_args(name: &str, region: &str) -> Vec<String> {
     ]
 }
 
+/// `batch-get-collection-group` argv — resolves the NextGen group's ID (which
+/// `delete-collection-group` requires) from its deterministic name.
+pub fn aoss_batch_get_group_args(collection: &str, region: &str) -> Vec<String> {
+    vec![
+        "opensearchserverless".into(),
+        "batch-get-collection-group".into(),
+        "--region".into(),
+        region.into(),
+        "--names".into(),
+        aoss_group_name(collection),
+    ]
+}
+
+/// `delete-collection-group` argv (needs the group ID, not the name). The group
+/// must be deleted explicitly — it does NOT auto-GC once empty, so leaving it
+/// orphans a billable NextGen group.
+pub fn aoss_delete_collection_group_args(group_id: &str, region: &str) -> Vec<String> {
+    vec![
+        "opensearchserverless".into(),
+        "delete-collection-group".into(),
+        "--region".into(),
+        region.into(),
+        "--id".into(),
+        group_id.into(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Local Migration Assistant deploy (helm into a dedicated KIND cluster) —
 // command sequences (pure data). Mirrors the upstream release CI's deploy:
@@ -593,6 +624,20 @@ mod tests {
     }
 
     #[test]
+    fn aoss_group_teardown_builders_resolve_then_delete_by_id() {
+        // Teardown must be able to find the group by name then delete it by ID
+        // (the group does not auto-GC, so it must be deleted explicitly).
+        let bg = aoss_batch_get_group_args("ma-demo-target", "eu-west-1");
+        assert!(bg.contains(&"batch-get-collection-group".to_string()));
+        assert!(bg.contains(&"cg-ma-demo-target".to_string()));
+        assert!(bg.contains(&"eu-west-1".to_string()));
+        let dg = aoss_delete_collection_group_args("grp-abc123", "eu-west-1");
+        assert!(dg.contains(&"delete-collection-group".to_string()));
+        assert!(dg.contains(&"grp-abc123".to_string()));
+        assert!(dg.contains(&"eu-west-1".to_string()));
+    }
+
+    #[test]
     fn no_snapshot_storage_omits_localstack() {
         let mut a = base();
         a.snapshot_storage = Some(SnapshotStorage::None);
@@ -632,6 +677,45 @@ mod tests {
             }
             _ => panic!("first action should create the source cluster"),
         }
+    }
+
+    #[test]
+    fn solr_source_skips_http_clients_and_seed_job() {
+        // Locust/sample-app + the seed Job speak the OpenSearch HTTP API, which a
+        // Solr source can't serve — the planner must not emit them for Solr even
+        // when clients + seeding were requested.
+        let mut a = base();
+        a.source_engine = Some(SourceEngine::Solr);
+        a.source_version = Some("9.7.0".into());
+        a.clients = vec![ClientApp::Locust, ClientApp::SampleSearchApp];
+        a.seed_data = Some(true);
+        let d = describes(&build(&a));
+        assert!(
+            !d.iter().any(|s| s.contains("locust")),
+            "no locust for solr"
+        );
+        assert!(
+            !d.iter().any(|s| s.contains("sample-search-app")),
+            "no sample app for solr"
+        );
+        assert!(
+            !d.iter().any(|s| s.contains("data-seed")),
+            "no HTTP seed job for solr"
+        );
+    }
+
+    #[test]
+    fn http_source_still_emits_clients_and_seed() {
+        // Guard the gate's other side: an ES/OS source with the same requests
+        // DOES get the clients + seed Job.
+        let mut a = base();
+        a.source_engine = Some(SourceEngine::Elasticsearch);
+        a.source_version = Some("7.10.2".into());
+        a.clients = vec![ClientApp::Locust];
+        a.seed_data = Some(true);
+        let d = describes(&build(&a));
+        assert!(d.iter().any(|s| s.contains("locust")));
+        assert!(d.iter().any(|s| s.contains("data-seed")));
     }
 
     #[test]

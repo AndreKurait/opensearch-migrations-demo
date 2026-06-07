@@ -228,8 +228,15 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
                  Install AWS CLI v2 (>= 2.34.56) and authenticate.",
             ));
         }
-        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| plan::AOSS_REGION.to_string());
-        let principal = self.aws_principal_arn();
+        // NextGen needs AWS CLI >= 2.34.56 (older silently creates a Classic
+        // collection). Warn rather than hard-fail — version strings vary, and we
+        // verify the NextGen endpoint form after creation as the real check.
+        if let Some(warning) = self.aoss_cli_version_warning() {
+            self.progress.info(&warning);
+        }
+        // Region from the saved plan (single source of truth), not the env.
+        let region = self.state.plan.answers.effective_aws_region().to_string();
+        let principal = self.aws_principal_arn()?;
 
         // The collection group must exist before the collection. "already
         // exists" / "ConflictException" make re-runs idempotent.
@@ -268,16 +275,27 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
 
         // Poll the collection to ACTIVE and capture the endpoint.
         let endpoint = self.poll_aoss_active(collection, &region)?;
+        // Verify we actually got NextGen, not Classic: NextGen endpoints are
+        // `<id>.aoss.<region>.on.aws`; Classic is `<id>.<region>.aoss.amazonaws.com`.
+        // A Classic endpoint means the CLI was too old / the flag was dropped.
+        if !endpoint.contains(".aoss.") || !endpoint.ends_with(".on.aws") {
+            self.progress.info(&format!(
+                "warning: endpoint {endpoint} is not the NextGen form (*.aoss.<region>.on.aws) — \
+                 this looks like a Classic collection (AWS CLI may be < 2.34.56)."
+            ));
+        }
         self.state.plan.aoss_endpoint = Some(endpoint);
         self.state.advance(Step::TargetUp);
         self.state.save()?;
         Ok(())
     }
 
-    /// Resolve the caller's IAM principal ARN (for the data access policy).
-    /// Falls back to a wildcard-free placeholder the operator can edit if STS
-    /// is unavailable through the runner.
-    fn aws_principal_arn(&self) -> String {
+    /// Resolve the caller's IAM principal ARN (for the data access policy). This
+    /// MUST succeed — an empty principal would create a data-access policy that
+    /// grants no one access, so the collection would 403 every request. Errors
+    /// with an actionable message when STS returns nothing usable (missing or
+    /// expired credentials), rather than silently building a useless policy.
+    fn aws_principal_arn(&self) -> Result<String> {
         let out = self.runner.run(
             "aws",
             &[
@@ -290,6 +308,13 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
             ],
         );
         let arn = out.trimmed_stdout().trim().to_string();
+        if !out.success() || arn.is_empty() || arn == "None" {
+            return Err(Error::die(
+                "could not resolve your AWS identity (sts get-caller-identity) — the AOSS data \
+                 access policy needs it. Refresh your credentials (e.g. `aws sso login` / \
+                 `ada credentials update`) and re-run.",
+            ));
+        }
         // Normalize an assumed-role ARN to its role ARN, which is what AOSS data
         // access policies expect: sts::ACCT:assumed-role/ROLE/SESSION ->
         // iam::ACCT:role/ROLE.
@@ -297,11 +322,34 @@ impl<'a, R: CommandRunner, P: Progress> App<'a, R, P> {
             if let Some((acct, tail)) = rest.split_once(':') {
                 if let Some(role_path) = tail.strip_prefix("assumed-role/") {
                     let role = role_path.split('/').next().unwrap_or(role_path);
-                    return format!("arn:aws:iam::{acct}:role/{role}");
+                    return Ok(format!("arn:aws:iam::{acct}:role/{role}"));
                 }
             }
         }
-        arn
+        Ok(arn)
+    }
+
+    /// A warning if the AWS CLI looks older than the NextGen floor (2.34.56),
+    /// which silently creates a *Classic* collection. Best-effort: returns `None`
+    /// when the version can't be parsed (we don't block on a fuzzy check — the
+    /// post-create endpoint-form assertion is the real guard).
+    fn aoss_cli_version_warning(&self) -> Option<String> {
+        let out = self.runner.run("aws", &["--version"]);
+        let v = out.trimmed_stdout();
+        // Format: "aws-cli/2.34.56 Python/... ...".
+        let token = v.split_whitespace().find(|t| t.starts_with("aws-cli/"))?;
+        let ver = token.strip_prefix("aws-cli/")?;
+        let mut parts = ver.split('.').filter_map(|n| n.parse::<u64>().ok());
+        let (maj, min, patch) = (parts.next()?, parts.next()?, parts.next().unwrap_or(0));
+        let ok = (maj, min, patch) >= (2, 34, 56);
+        if ok {
+            None
+        } else {
+            Some(format!(
+                "AWS CLI {ver} is older than 2.34.56 — NextGen may silently fall back to a \
+                 Classic collection. Upgrade the AWS CLI if the target isn't NextGen."
+            ))
+        }
     }
 
     /// Poll `batch-get-collection` until ACTIVE (or a bounded number of tries),
@@ -983,6 +1031,32 @@ mod tests {
         app.state.plan.answers = aoss_answers();
         let err = app.provision(&aoss_answers()).unwrap_err();
         assert!(err.message.contains("aws CLI not found"));
+        std::env::remove_var("MA_DEMO_TEST");
+    }
+
+    #[test]
+    fn provision_aoss_fails_fast_when_identity_unresolved() {
+        // STS returns nothing usable (expired creds) — provisioning must abort
+        // with an actionable message instead of building a no-access policy.
+        std::env::set_var("MA_DEMO_TEST", "1");
+        let r = ready_runner().with_command("aws").stub_stderr(
+            "aws",
+            &["sts", "get-caller-identity"],
+            255,
+            "ExpiredToken",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let p = SilentProgress;
+        let mut app = App::new(&r, tmp.path(), &p);
+        app.state.plan.answers = aoss_answers();
+        let err = app.provision(&aoss_answers()).unwrap_err();
+        assert!(
+            err.message.contains("could not resolve your AWS identity"),
+            "got: {}",
+            err.message
+        );
+        // Must not have created the data access policy with an empty principal.
+        assert!(!r.any_call_contains("create-access-policy"));
         std::env::remove_var("MA_DEMO_TEST");
     }
 }

@@ -59,7 +59,12 @@ fn ans(id: &str) -> Outcome {
     Outcome::Answered(Answer::Choice(id.into()))
 }
 impl Wizardish for Script {
-    fn ask(&self, question: &wizard::Question, _preselect: &[String]) -> Result<Outcome> {
+    fn ask(
+        &self,
+        question: &wizard::Question,
+        _preselect: &[String],
+        _step: Option<(usize, usize)>,
+    ) -> Result<Outcome> {
         self.answers
             .get(&question.id)
             .cloned()

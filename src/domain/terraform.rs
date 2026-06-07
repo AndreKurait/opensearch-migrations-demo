@@ -326,7 +326,9 @@ pub struct TfFile {
 pub fn files(answers: &Answers) -> Vec<TfFile> {
     let engine = answers.source_engine.unwrap_or(SourceEngine::Elasticsearch);
     let src_ver = answers.source_version.as_deref().unwrap_or("7.10.2");
-    let region = "us-east-1";
+    // The provider region follows the plan (the same value the apply uses via
+    // -var region=…), so a cloud user outside us-east-1 isn't silently retargeted.
+    let region = answers.effective_aws_region();
 
     let mut out = vec![
         TfFile {

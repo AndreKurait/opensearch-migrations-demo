@@ -32,6 +32,10 @@ pub enum ScreenMsg {
     /// Confirm: select the cursor option (single) / accept the set (multi) /
     /// accept the yes-no.
     Confirm,
+    /// On a yes/no screen: force the value to the given bool, then confirm — the
+    /// `y`/`n` shortcuts. (A plain `Confirm` accepts whatever the cursor is on;
+    /// this is what makes `y`/`n` answer *yes*/*no* regardless of the cursor.)
+    ConfirmYesNo(bool),
     /// Cancel the whole wizard.
     Cancel,
 }
@@ -58,6 +62,9 @@ pub struct Screen {
     pub yes: bool,
     /// Set when the question is answered/cancelled — stops the loop.
     pub outcome: Option<Outcome>,
+    /// `(step, total)` for the footer's "Step N of M" affordance — `None` hides
+    /// it (e.g. an isolated edit re-ask from the review screen).
+    pub step: Option<(usize, usize)>,
 }
 
 impl Screen {
@@ -87,7 +94,15 @@ impl Screen {
             selected,
             yes: true,
             outcome: None,
+            step: None,
         }
+    }
+
+    /// Set the `(step, total)` shown in the footer. Builder-style so `new` stays
+    /// the common path and tests don't need to pass a step.
+    pub fn with_step(mut self, step: Option<(usize, usize)>) -> Self {
+        self.step = step;
+        self
     }
 
     /// The option list for choice questions (empty for yes/no).
@@ -112,6 +127,10 @@ impl Screen {
             ScreenMsg::Up => self.move_cursor(-1),
             ScreenMsg::Toggle => self.toggle(),
             ScreenMsg::Confirm => self.confirm(),
+            ScreenMsg::ConfirmYesNo(v) => {
+                self.yes = v;
+                self.confirm();
+            }
             ScreenMsg::Cancel => self.outcome = Some(Outcome::Cancelled),
         }
     }
@@ -176,13 +195,10 @@ impl Screen {
             Char(' ') => Some(ScreenMsg::Toggle),
             Enter => Some(ScreenMsg::Confirm),
             Esc => Some(ScreenMsg::Cancel),
-            // y/n shortcuts on yes-no screens.
-            Char('y') | Char('Y') if self.is_yesno() => {
-                // Caller-visible: set + confirm in one is handled by update
-                // sequence in the loop; here we just map to Toggle→Confirm via
-                // Confirm after forcing yes. Simpler: treat as Confirm of yes.
-                Some(ScreenMsg::Confirm)
-            }
+            // y/n shortcuts on yes-no screens force the value (not "confirm
+            // whatever the cursor is on"), so `y` always answers yes and `n` no.
+            Char('y') | Char('Y') if self.is_yesno() => Some(ScreenMsg::ConfirmYesNo(true)),
+            Char('n') | Char('N') if self.is_yesno() => Some(ScreenMsg::ConfirmYesNo(false)),
             _ => None,
         }
     }
@@ -275,13 +291,20 @@ impl Screen {
         }
     }
 
-    /// The footer hint for this question kind.
-    fn hint(&self) -> &'static str {
-        match self.question.kind {
-            Kind::SingleChoice(_) => "↑↓ move · Enter select · Esc cancel",
-            Kind::MultiChoice(_) => "↑↓ move · Space toggle · Enter confirm · Esc cancel",
-            Kind::YesNo => "↑↓/Space flip · Enter confirm · Esc cancel",
-        }
+    /// The footer hint for this question kind: a "Step N of M" prefix (when a
+    /// step is set), the key bindings (including the y/n yes-no shortcuts, the
+    /// `q`/`^C` aborts), and a note that everything is editable on the review.
+    fn hint(&self) -> String {
+        let keys = match self.question.kind {
+            Kind::SingleChoice(_) => "↑↓ move · Enter select · Esc/^C cancel",
+            Kind::MultiChoice(_) => "↑↓ move · Space toggle · Enter confirm · Esc/^C cancel",
+            Kind::YesNo => "↑↓/Space flip · y/n or Enter confirm · Esc/^C cancel",
+        };
+        let prefix = match self.step {
+            Some((n, total)) => format!("Step {n} of {total} · "),
+            None => String::new(),
+        };
+        format!("{prefix}{keys} · editable on the final review")
     }
 }
 
@@ -309,10 +332,18 @@ pub fn is_ctrl_c(key: &ratatui::crossterm::event::KeyEvent) -> bool {
 
 /// Drive one question interactively to an [`Outcome`]. Sets up the terminal,
 /// runs the draw→input loop, and ALWAYS restores the terminal before returning.
-/// `preselect` seeds multi-choice selections (resume).
-pub fn run(question: Question, preselect: &[String]) -> std::io::Result<Outcome> {
+/// `preselect` seeds multi-choice selections (resume); `step` is the optional
+/// `(n, total)` shown in the footer.
+pub fn run(
+    question: Question,
+    preselect: &[String],
+    step: Option<(usize, usize)>,
+) -> std::io::Result<Outcome> {
     let mut terminal = ratatui::try_init()?;
-    let result = run_event_loop(&mut terminal, Screen::new(question, preselect));
+    let result = run_event_loop(
+        &mut terminal,
+        Screen::new(question, preselect).with_step(step),
+    );
     ratatui::restore();
     result
 }
@@ -663,6 +694,49 @@ mod tests {
         assert!(!s.yes);
         s.update(ScreenMsg::Confirm);
         assert_eq!(s.outcome, Some(Outcome::Answered(Answer::Bool(false))));
+    }
+
+    #[test]
+    fn y_answers_yes_and_n_answers_no_regardless_of_cursor() {
+        // Regression: `y`/`n` must force the value, not "confirm whatever the
+        // cursor is on" — previously `y` while flipped to No confirmed No.
+        let s = yesno();
+        assert_eq!(
+            s.key_to_msg(KeyCode::Char('y')),
+            Some(ScreenMsg::ConfirmYesNo(true))
+        );
+        assert_eq!(
+            s.key_to_msg(KeyCode::Char('n')),
+            Some(ScreenMsg::ConfirmYesNo(false))
+        );
+
+        // Cursor on "No", press y → answers YES.
+        let mut s = yesno();
+        s.update(ScreenMsg::Down); // flip to No
+        assert!(!s.yes);
+        s.update(ScreenMsg::ConfirmYesNo(true));
+        assert_eq!(s.outcome, Some(Outcome::Answered(Answer::Bool(true))));
+
+        // Cursor on "Yes" (default), press n → answers NO.
+        let mut s = yesno();
+        s.update(ScreenMsg::ConfirmYesNo(false));
+        assert_eq!(s.outcome, Some(Outcome::Answered(Answer::Bool(false))));
+    }
+
+    #[test]
+    fn footer_shows_step_counter_when_set() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let q = wizard::build(QuestionId::Target, &Answers::new());
+        let s = Screen::new(q, &[]).with_step(Some((1, 9)));
+        let mut t = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        t.draw(|f| s.view(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let text: String = (0..buf.area().height)
+            .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(text.contains("Step 1 of 9"), "footer shows step counter");
+        assert!(text.contains("editable on the final review"));
     }
 
     #[test]

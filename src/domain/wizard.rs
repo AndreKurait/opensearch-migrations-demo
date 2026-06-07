@@ -322,6 +322,22 @@ pub fn next_question_id(a: &Answers) -> QuestionId {
     QuestionId::Review
 }
 
+/// The wizard's position as `(step, total)` for question `id`, counting only the
+/// questions that *apply* to these answers (so a flow that skips target-kind /
+/// version / AWS / handoff reports an accurate "Step N of M", not a misleading
+/// total of 13). `step` is 1-based; `id` not in the applicable set yields
+/// `(applicable_total, applicable_total)` as a safe clamp. Pure.
+pub fn progress_position(id: QuestionId, a: &Answers) -> (usize, usize) {
+    let applicable: Vec<QuestionId> = FLOW.iter().copied().filter(|q| applies(*q, a)).collect();
+    let total = applicable.len();
+    let step = applicable
+        .iter()
+        .position(|q| *q == id)
+        .map(|p| p + 1)
+        .unwrap_or(total);
+    (step, total)
+}
+
 /// Build the fully-resolved [`Question`] for the next step (options depend on
 /// prior answers — e.g. the source-version options depend on the chosen
 /// engine).
@@ -1129,5 +1145,34 @@ mod tests {
         fill_defaults(&mut a);
         // Applying anything at review just re-derives review.
         assert_eq!(next_question_id(&a), QuestionId::Review);
+    }
+
+    #[test]
+    fn progress_position_counts_only_applicable_questions() {
+        // A local + leave-to-MA plan skips TargetKind, TargetVersion, AwsProfile,
+        // AwsRegion — the total must reflect that, not the raw FLOW length (13).
+        let mut a = Answers::new();
+        a.target = Some(Target::Local);
+        a.target_mode = Some(TargetMode::LeaveToMa);
+        let (_, total) = progress_position(QuestionId::Target, &a);
+        // FLOW has 13; this plan drops 4 (kind/version/profile/region) → 9.
+        assert_eq!(total, 9, "total counts only applicable questions");
+        // Target is first in the flow.
+        assert_eq!(progress_position(QuestionId::Target, &a).0, 1);
+        // SeedData comes after the skipped questions — its step reflects the
+        // compacted count, not its raw index.
+        let (step, t2) = progress_position(QuestionId::SeedData, &a);
+        assert_eq!(t2, 9);
+        assert!(step <= total, "step within total");
+
+        // A cloud + provision-AOSS plan re-includes AWS profile/region.
+        let mut c = Answers::new();
+        c.target = Some(Target::Cloud);
+        c.target_mode = Some(TargetMode::Provision);
+        c.target_kind = Some(TargetKind::AossServerlessNextGen);
+        let (_, ctotal) = progress_position(QuestionId::Target, &c);
+        // Cloud drops MaHandoff (1) and TargetVersion (AOSS has none) but adds
+        // AwsProfile + AwsRegion — so it differs from the local total.
+        assert!(ctotal >= 10, "cloud/AOSS plan includes AWS questions");
     }
 }

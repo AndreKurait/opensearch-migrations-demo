@@ -39,6 +39,20 @@ trap '[[ -n "$tmp" ]] && rm -rf "$tmp"' EXIT
 require uname
 require tar
 
+# --- sha256 of a file, as a bare lowercase hex digest (portable) ---
+# Prefers shasum (always on macOS), falls back to sha256sum (Linux). Returns
+# empty if neither exists — the caller decides whether that's fatal.
+sha256_of() {
+  local f="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  else
+    printf ''
+  fi
+}
+
 # --- detect target triple ---
 detect_target() {
   local os arch
@@ -96,6 +110,29 @@ main() {
   tmp="$(mktemp -d)"
   curl -fsSL --max-time 120 -o "$tmp/$tarball" "$url" \
     || die "could not download $url"
+
+  # Verify the published SHA-256 before trusting the archive (supply-chain
+  # integrity). Every release ships a "<tarball>.sha256" alongside the tarball.
+  # The local digest tool is the same shasum/sha256sum the release used.
+  local local_sum expected_sum
+  local_sum="$(sha256_of "$tmp/$tarball")"
+  if [[ -z "$local_sum" ]]; then
+    printf '%s no sha256 tool (shasum/sha256sum) found; skipping checksum verification\n' \
+      "$(c_yellow '!')"
+  elif expected_sum="$(curl -fsSL --max-time 30 "${url}.sha256" 2>/dev/null | awk '{print $1}')" \
+       && [[ -n "$expected_sum" ]]; then
+    if [[ "$local_sum" != "$expected_sum" ]]; then
+      die "checksum mismatch for $tarball
+    expected: $expected_sum
+    actual:   $local_sum
+  The download may be corrupt or tampered with — aborting."
+    fi
+    printf '  %s %s\n' "$(c_dim 'sha256:')" "$(c_green 'verified')"
+  else
+    printf '%s could not fetch %s; skipping checksum verification\n' \
+      "$(c_yellow '!')" "${tarball}.sha256"
+  fi
+
   tar -xzf "$tmp/$tarball" -C "$tmp"
 
   # The tarball contains a single binary named ma-demo-<target>; install it as

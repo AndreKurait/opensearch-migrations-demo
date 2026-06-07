@@ -638,8 +638,17 @@ fn statefulset_ready<R: CommandRunner>(
 // ---------------------------------------------------------------------------
 
 /// Render the dashboard into `frame` for `snap`. `answers` provides the plan
-/// summary header.
-pub fn render(frame: &mut Frame, snap: &Snapshot, answers: &Answers) {
+/// summary header; `tick` is the live re-probe interval (shown in the footer);
+/// `next_step` is the MA launch command, surfaced in the footer so the single
+/// most important next action stays visible while the dashboard owns the screen
+/// (`None` for `ma-demo status`, which has no command in scope).
+pub fn render(
+    frame: &mut Frame,
+    snap: &Snapshot,
+    answers: &Answers,
+    tick: std::time::Duration,
+    next_step: Option<&str>,
+) {
     let area = frame.area();
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(4),
@@ -687,7 +696,16 @@ pub fn render(frame: &mut Frame, snap: &Snapshot, answers: &Answers) {
     panel(frame, target_a, " Target ", &snap.target);
     panel(frame, ma_a, " Migration Assistant ", &snap.ma);
 
-    let hint = "live · refreshing every 2s · press q or Esc to exit";
+    // Footer: a live/quit hint, plus the MA launch command when we have one so
+    // the most important next step stays on screen. Truncate to the footer width
+    // so a long argv never wraps (which would shrink the body / panic).
+    let secs = tick.as_secs().max(1);
+    let quit = format!("live · refreshing every {secs}s · press q, Esc, or ^C to exit");
+    let hint = match next_step {
+        Some(cmd) if !cmd.is_empty() => format!("Launch MA: {cmd}   ·   {quit}"),
+        _ => quit,
+    };
+    let hint = truncate(&hint, footer.width as usize);
     Paragraph::new(hint.dim()).render(footer, frame.buffer_mut());
 }
 
@@ -743,11 +761,18 @@ fn panel(frame: &mut Frame, area: Rect, title: &str, rows: &[Row]) {
         .render(area, frame.buffer_mut());
 }
 
+/// Truncate to at most `max` characters, appending `…` when shortened. Counts
+/// by `char`, not bytes, so it never panics on a multibyte boundary (e.g. CJK
+/// text or the `·` separators in the footer).
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let kept: String = s.chars().take(max - 1).collect();
+        format!("{kept}…")
     }
 }
 
@@ -772,9 +797,10 @@ pub fn run_live<R: CommandRunner>(
     runner: &R,
     answers: &Answers,
     tick: std::time::Duration,
+    next_step: Option<&str>,
 ) -> std::io::Result<()> {
     let mut terminal = ratatui::try_init()?;
-    let result = run_loop(&mut terminal, runner, answers, tick);
+    let result = run_loop(&mut terminal, runner, answers, tick, next_step);
     ratatui::restore();
     result
 }
@@ -784,6 +810,7 @@ fn run_loop<R: CommandRunner>(
     runner: &R,
     answers: &Answers,
     tick: std::time::Duration,
+    next_step: Option<&str>,
 ) -> std::io::Result<()> {
     use ratatui::crossterm::event::{self, Event};
     let mut counter: u64 = 0;
@@ -794,7 +821,7 @@ fn run_loop<R: CommandRunner>(
     let spin = std::time::Duration::from_millis(120);
     loop {
         snap.frame = frame;
-        terminal.draw(|f| render(f, &snap, answers))?;
+        terminal.draw(|f| render(f, &snap, answers, tick, next_step))?;
         // Poll input on the spinner interval so the animation stays smooth AND
         // quitting is snappy, independent of the (slower) resource re-probe.
         if event::poll(spin)? {
@@ -908,7 +935,9 @@ mod tests {
         let r = MockRunner::new().with_command("aws");
         let snap = probe(&r, &cloud_answers(), 0);
         let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-        t.draw(|f| render(f, &snap, &cloud_answers())).unwrap();
+        let tick = std::time::Duration::from_secs(2);
+        t.draw(|f| render(f, &snap, &cloud_answers(), tick, Some("ws/bin/ma migrate")))
+            .unwrap();
         let buf = t.backend().buffer().clone();
         let text: String = (0..buf.area().height)
             .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
@@ -926,6 +955,31 @@ mod tests {
             !text.contains("Seeded indices"),
             "no in-cluster index panel on cloud"
         );
+        // The MA launch command is surfaced in the footer.
+        assert!(
+            text.contains("Launch MA: ws/bin/ma migrate"),
+            "footer must show the MA launch command when provided"
+        );
+    }
+
+    #[test]
+    fn footer_without_next_step_shows_only_quit_hint_and_tick() {
+        let r = MockRunner::new();
+        let snap = probe(&r, &local_answers(), 0);
+        let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        let tick = std::time::Duration::from_secs(5);
+        t.draw(|f| render(f, &snap, &local_answers(), tick, None))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        let text: String = (0..buf.area().height)
+            .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(
+            text.contains("refreshing every 5s"),
+            "tick reflected in footer"
+        );
+        assert!(!text.contains("Launch MA:"), "no command → no launch hint");
     }
 
     #[test]
@@ -938,7 +992,9 @@ mod tests {
         // inner row (y=1), not the border row (y=0).
         let glyph_at = |s: &Snapshot| {
             let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-            t.draw(|f| render(f, s, &local_answers())).unwrap();
+            let tick = std::time::Duration::from_secs(2);
+            t.draw(|f| render(f, s, &local_answers(), tick, None))
+                .unwrap();
             let buf = t.backend().buffer().clone();
             (0..buf.area().width)
                 .map(|x| buf[(x, 1)].symbol().to_string())
@@ -1088,7 +1144,9 @@ mod tests {
             .stub("kubectl", &["_count"], 0, r#"{"count":100}"#);
         let snap = probe(&r, &local_answers(), 3);
         let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        t.draw(|f| render(f, &snap, &local_answers())).unwrap();
+        let tick = std::time::Duration::from_secs(2);
+        t.draw(|f| render(f, &snap, &local_answers(), tick, None))
+            .unwrap();
         let buf = t.backend().buffer().clone();
         let text: String = (0..buf.area().height)
             .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))

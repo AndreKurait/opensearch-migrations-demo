@@ -27,8 +27,14 @@ pub const VERSION: &str = match option_env!("DEMO_VERSION") {
 /// drive a scripted collector so the whole dispatch is assertable.
 pub trait Wizardish {
     /// Present `question`, returning the chosen [`Outcome`]. `preselect` seeds
-    /// multi-choice (resume).
-    fn ask(&self, question: &wizard::Question, preselect: &[String]) -> Result<Outcome>;
+    /// multi-choice (resume); `step` is the optional `(n, total)` progress shown
+    /// in the footer (`None` for an isolated edit re-ask).
+    fn ask(
+        &self,
+        question: &wizard::Question,
+        preselect: &[String],
+        step: Option<(usize, usize)>,
+    ) -> Result<Outcome>;
 
     /// Present the editable review of the plan — with the contextual header
     /// (version, workspace, AWS identity, upgrade hint) — and return the
@@ -39,8 +45,13 @@ pub trait Wizardish {
 /// The interactive Ratatui wizard.
 pub struct TuiWizard;
 impl Wizardish for TuiWizard {
-    fn ask(&self, question: &wizard::Question, preselect: &[String]) -> Result<Outcome> {
-        crate::tui::run(question.clone(), preselect).map_err(Error::from)
+    fn ask(
+        &self,
+        question: &wizard::Question,
+        preselect: &[String],
+        step: Option<(usize, usize)>,
+    ) -> Result<Outcome> {
+        crate::tui::run(question.clone(), preselect, step).map_err(Error::from)
     }
     fn review(&self, rows: &[wizard::ReviewRow], context: &ReviewContext) -> Result<ReviewOutcome> {
         crate::tui::run_review(rows.to_vec(), context.clone()).map_err(Error::from)
@@ -72,6 +83,10 @@ pub struct Flags {
     /// On the cloud path, emit the Terraform but do NOT run `terraform apply`
     /// (the operator applies it themselves).
     pub no_apply: bool,
+    /// Explicitly opt in to applying real cloud infra on a NON-interactive run
+    /// (`--apply` / `--auto-approve`). Interactive runs apply on review-confirm;
+    /// `-y` cloud runs require this so CI never stands up billable infra silently.
+    pub apply: bool,
     /// Override the AWS profile for cloud/AOSS operations.
     pub aws_profile: Option<String>,
     /// Override the AWS region for cloud/AOSS operations.
@@ -88,6 +103,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "--dry-run" | "--plan" => f.dry_run = true,
             "--no-dashboard" => f.no_dashboard = true,
             "--no-apply" => f.no_apply = true,
+            "--apply" | "--auto-approve" => f.apply = true,
             "--workspace" => {
                 f.workspace = args.get(i + 1).cloned();
                 i += 1;
@@ -327,16 +343,43 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
         }
     }
 
-    // Provision through the orchestrator. On the cloud path, apply Terraform
-    // for real unless --no-apply was passed (a non-interactive run also applies,
-    // so CI can stand infra up; pass --no-apply to emit-only).
+    // Decide whether the cloud path applies real infra. Interactive runs applied
+    // on the review-confirm above; a NON-interactive cloud run must opt in with
+    // --apply (so `-y` in CI never silently stands up billable infrastructure).
+    // --no-apply always wins (emit-only).
+    let is_cloud = answers.target == Some(crate::model::Target::Cloud);
+    let apply_cloud = is_cloud && !flags.no_apply && (!flags.non_interactive || flags.apply);
+
+    // Provision through the orchestrator.
     let progress = UiProgress;
     let mut app = App::new(runner, &workspace, &progress);
     app.state.plan.answers = answers.clone();
+
+    // A one-shot roadmap of the phases ahead, so the operator sees how many
+    // steps remain during a multi-minute local provision (interactive only).
+    if !flags.non_interactive && answers.target == Some(crate::model::Target::Local) {
+        ui::step("Provisioning roadmap");
+        ui::dim(&crate::progress::plain(crate::state::Step::Planned));
+    }
+
     app.preflight(&answers)?;
-    let apply_cloud = answers.target == Some(crate::model::Target::Cloud) && !flags.no_apply;
     let plan = app.provision_with(&answers, apply_cloud)?;
     print_endpoints(&plan, &answers, app.state.plan.aoss_endpoint.as_deref());
+
+    // Cloud emit-only: there's nothing live to watch (no infra was applied), so
+    // skip the all-Pending dashboard and tell the operator how to apply + watch.
+    if is_cloud && !apply_cloud {
+        ui::ok("Terraform written — review it, then apply when ready.");
+        ui::info(&format!(
+            "  terraform -chdir={ws}/terraform init && terraform -chdir={ws}/terraform apply",
+            ws = workspace.display()
+        ));
+        if flags.non_interactive {
+            ui::dim("  (or re-run with --apply to have ma-demo apply it for you)");
+        }
+        ui::dim("  Then watch it live with:  ma-demo status");
+        return Ok(());
+    }
 
     // Prepare the Migration Assistant handoff. Local-helm deploys MA into KIND
     // (returns the console-exec argv); otherwise install the EKS-targeting CLI
@@ -364,12 +407,18 @@ fn cmd_run<R: CommandRunner, W: Wizardish>(
         ui::dim("  See live status any time with:  ma-demo status");
         return Ok(());
     }
+    let launch = argv.join(" ");
     ui::info(&format!(
-        "  When ready, launch the Migration Assistant:  {}",
-        argv.join(" ")
+        "  When ready, launch the Migration Assistant:  {launch}"
     ));
     ui::dim("  Opening the live status dashboard… (press q to exit, then run the command above)");
-    dashboard::run_live(runner, &answers, std::time::Duration::from_secs(2))?;
+    // Pass the launch command so it stays visible in the dashboard footer.
+    dashboard::run_live(
+        runner,
+        &answers,
+        std::time::Duration::from_secs(2),
+        Some(&launch),
+    )?;
     ui::ok("Dashboard closed. Your environment is still running.");
     ui::info(&format!("  Migration Assistant:  {}", argv.join(" ")));
     ui::dim("  Tear it all down with:  ma-demo destroy");
@@ -396,6 +445,7 @@ fn cmd_status<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
         runner,
         &state.plan.answers,
         std::time::Duration::from_secs(2),
+        None,
     )?;
     Ok(())
 }
@@ -419,7 +469,8 @@ fn collect_answers<W: Wizardish>(
         }
         let q = wizard::build(id, answers);
         let preselect = preselect_for(id, answers);
-        match wiz.ask(&q, &preselect)? {
+        let step = Some(wizard::progress_position(id, answers));
+        match wiz.ask(&q, &preselect, step)? {
             Outcome::Answered(ans) => {
                 wizard::apply(answers, id, ans);
             }
@@ -467,10 +518,11 @@ fn review_and_edit<R: CommandRunner, W: Wizardish>(
             ReviewOutcome::Confirm => return Ok(ReviewDecision::Confirm),
             ReviewOutcome::Cancel => return Ok(ReviewDecision::Cancel),
             ReviewOutcome::Edit(qid) => {
-                // Re-ask the chosen question, applying the new answer.
+                // Re-ask the chosen question, applying the new answer. No step
+                // counter — this is an isolated edit, not a position in the flow.
                 let q = wizard::build(qid, answers);
                 let preselect = preselect_for(qid, answers);
-                match wiz.ask(&q, &preselect)? {
+                match wiz.ask(&q, &preselect, None)? {
                     Outcome::Answered(ans) => {
                         wizard::apply(answers, qid, ans);
                     }
@@ -568,9 +620,10 @@ fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
     }
 
     // Tear down the AOSS NextGen target (collection → group → policies), if one
-    // was provisioned and the aws CLI is available.
+    // was provisioned and the aws CLI is available. The saved plan supplies the
+    // profile + region so teardown hits the same account/region the create did.
     if provisioned_aoss {
-        destroy_aoss(runner, &state.plan.answers.aoss_collection_name());
+        destroy_aoss(runner, &state.plan.answers);
     }
 
     if workspace.exists() {
@@ -581,24 +634,29 @@ fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Tear down an AOSS NextGen target in reverse-dependency order: resolve the
-/// collection ID, delete the collection, then the policies. Best-effort + idem-
-/// potent — missing resources are not fatal (the workspace wipe still proceeds).
-fn destroy_aoss<R: CommandRunner>(runner: &R, collection: &str) {
+/// Tear down an AOSS NextGen target in reverse-dependency order: collection →
+/// policies → collection group. Best-effort + idempotent — missing resources are
+/// not fatal (the workspace wipe still proceeds). The region + profile come from
+/// the saved plan (via the exported AWS env), so teardown targets the same
+/// account/region the create used — not whatever the ambient env happens to be.
+fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) {
     if !runner.has_command("aws") {
         ui::warn("aws CLI not on PATH; skipping AOSS teardown");
         return;
     }
-    let region =
-        std::env::var("AWS_REGION").unwrap_or_else(|_| crate::plan::AOSS_REGION.to_string());
+    // Export AWS_PROFILE/AWS_REGION from the plan so every `aws` call below hits
+    // the right account/region.
+    crate::app::export_aws_env(answers);
+    let collection = answers.aoss_collection_name();
+    let region = answers.effective_aws_region();
     ui::step(&format!("delete AOSS collection {collection}"));
 
     // Resolve the collection ID from its name (delete-collection wants the ID).
-    let bg = crate::plan::aoss_batch_get_args(collection, &region);
+    let bg = crate::plan::aoss_batch_get_args(&collection, region);
     let bg_ref: Vec<&str> = bg.iter().map(String::as_str).collect();
     let out = runner.run("aws", &bg_ref);
     if let Some(id) = parse_aoss_id(&out.stdout) {
-        let del = crate::plan::aoss_delete_collection_args(&id, &region);
+        let del = crate::plan::aoss_delete_collection_args(&id, region);
         let del_ref: Vec<&str> = del.iter().map(String::as_str).collect();
         let r = runner.run("aws", &del_ref);
         if r.success() {
@@ -615,20 +673,52 @@ fn destroy_aoss<R: CommandRunner>(runner: &R, collection: &str) {
         (format!("{collection}-enc"), "encryption"),
         (format!("{collection}-net"), "network"),
     ] {
-        let a = crate::plan::aoss_delete_security_policy_args(&name, ptype, &region);
+        let a = crate::plan::aoss_delete_security_policy_args(&name, ptype, region);
         let aref: Vec<&str> = a.iter().map(String::as_str).collect();
         runner.run("aws", &aref);
     }
-    let dp = crate::plan::aoss_delete_access_policy_args(&format!("{collection}-data"), &region);
+    let dp = crate::plan::aoss_delete_access_policy_args(&format!("{collection}-data"), region);
     let dpref: Vec<&str> = dp.iter().map(String::as_str).collect();
     runner.run("aws", &dpref);
-    ui::dim("  AOSS policies + collection group left for `aws` to GC (group deletes once empty)");
+
+    // The collection group does NOT auto-GC once empty — delete it explicitly,
+    // or it lingers as a billable NextGen group. Resolve its ID then delete.
+    let gg = crate::plan::aoss_batch_get_group_args(&collection, region);
+    let gg_ref: Vec<&str> = gg.iter().map(String::as_str).collect();
+    let gout = runner.run("aws", &gg_ref);
+    if let Some(gid) = parse_aoss_group_id(&gout.stdout) {
+        let dg = crate::plan::aoss_delete_collection_group_args(&gid, region);
+        let dg_ref: Vec<&str> = dg.iter().map(String::as_str).collect();
+        let r = runner.run("aws", &dg_ref);
+        if r.success() {
+            ui::ok(&format!(
+                "collection group {} deleted",
+                crate::plan::aoss_group_name(&collection)
+            ));
+        } else {
+            // The group can't delete until the collection is fully gone; surface
+            // it so the operator can re-run `destroy` once the collection drains.
+            ui::warn(&format!(
+                "collection group delete: {} (re-run `ma-demo destroy` once the collection finishes deleting)",
+                r.stderr.trim()
+            ));
+        }
+    } else {
+        ui::dim("  collection group not found (already gone)");
+    }
 }
 
 /// Parse the collection ID out of a `batch-get-collection` response (any status).
 fn parse_aoss_id(json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let details = v.get("collectionDetails")?.as_array()?;
+    details.first()?.get("id")?.as_str().map(|s| s.to_string())
+}
+
+/// Parse the group ID out of a `batch-get-collection-group` response.
+fn parse_aoss_group_id(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let details = v.get("collectionGroupDetails")?.as_array()?;
     details.first()?.get("id")?.as_str().map(|s| s.to_string())
 }
 
@@ -792,7 +882,12 @@ mod tests {
         }
     }
     impl Wizardish for ScriptWizard {
-        fn ask(&self, question: &wizard::Question, _preselect: &[String]) -> Result<Outcome> {
+        fn ask(
+            &self,
+            question: &wizard::Question,
+            _preselect: &[String],
+            _step: Option<(usize, usize)>,
+        ) -> Result<Outcome> {
             self.asked.borrow_mut().push(question.id);
             self.answers
                 .get(key(question.id))
@@ -861,6 +956,84 @@ mod tests {
         let f2 = parse_flags(&args(&["--workspace=/x", "--plan"]));
         assert_eq!(f2.workspace.as_deref(), Some("/x"));
         assert!(f2.dry_run);
+
+        // The cloud-apply opt-in (both spellings) and emit-only flag.
+        assert!(parse_flags(&args(&["--apply"])).apply);
+        assert!(parse_flags(&args(&["--auto-approve"])).apply);
+        assert!(parse_flags(&args(&["--no-apply"])).no_apply);
+        assert!(!parse_flags(&args(&["-y"])).apply);
+    }
+
+    #[test]
+    fn non_interactive_cloud_does_not_apply_without_apply_flag() {
+        // A `-y` cloud run must NOT stand up real infra unless --apply is given.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut st = State::new(&ws);
+        let mut a = Answers::new();
+        a.target = Some(crate::model::Target::Cloud);
+        a.source_engine = Some(crate::model::SourceEngine::Elasticsearch);
+        a.source_version = Some("7.10.2".into());
+        a.plugins_done = true;
+        a.snapshot_storage = Some(crate::model::SnapshotStorage::AwsS3);
+        a.target_mode = Some(crate::model::TargetMode::LeaveToMa);
+        a.aws_profile = Some("default".into());
+        a.aws_region = Some("us-east-1".into());
+        a.clients_done = true;
+        a.seed_data = Some(false);
+        st.plan.answers = a;
+        st.save().unwrap();
+
+        let r = ready_runner().with_command("terraform");
+        let w = ScriptWizard::new();
+        let code = dispatch(
+            &args(&["run", "-y", "--workspace", ws.to_str().unwrap()]),
+            &r,
+            &w,
+        );
+        assert_eq!(code, 0);
+        // Emit-only: terraform files written, but NOT applied.
+        assert!(!r.any_call_contains("terraform -chdir"));
+        assert!(ws.join("terraform/providers.tf").exists());
+    }
+
+    #[test]
+    fn non_interactive_cloud_applies_with_apply_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut st = State::new(&ws);
+        let mut a = Answers::new();
+        a.target = Some(crate::model::Target::Cloud);
+        a.source_engine = Some(crate::model::SourceEngine::Elasticsearch);
+        a.source_version = Some("7.10.2".into());
+        a.plugins_done = true;
+        a.snapshot_storage = Some(crate::model::SnapshotStorage::AwsS3);
+        a.target_mode = Some(crate::model::TargetMode::LeaveToMa);
+        a.aws_profile = Some("default".into());
+        a.aws_region = Some("us-east-1".into());
+        a.clients_done = true;
+        a.seed_data = Some(false);
+        st.plan.answers = a;
+        st.save().unwrap();
+
+        let r = ready_runner().with_command("terraform");
+        let w = ScriptWizard::new();
+        let code = dispatch(
+            &args(&[
+                "run",
+                "-y",
+                "--apply",
+                "--no-dashboard",
+                "--workspace",
+                ws.to_str().unwrap(),
+            ]),
+            &r,
+            &w,
+        );
+        assert_eq!(code, 0);
+        // --apply → terraform init + apply actually run.
+        assert!(r.any_call_contains("terraform -chdir"));
+        assert!(r.any_call_contains("apply"));
     }
 
     #[test]
@@ -1101,12 +1274,22 @@ mod tests {
         st.plan.answers.target_kind = Some(crate::model::TargetKind::AossServerlessNextGen);
         st.save().unwrap();
 
-        let r = MockRunner::new().with_command("kind").with_command("aws").stub(
-            "aws",
-            &["batch-get-collection"],
-            0,
-            r#"{"collectionDetails":[{"status":"ACTIVE","id":"colid123","collectionEndpoint":"https://x.aoss.us-east-1.on.aws"}]}"#,
-        );
+        let r = MockRunner::new()
+            .with_command("kind")
+            .with_command("aws")
+            // More specific stub first (first-match-wins): the group resolve.
+            .stub(
+                "aws",
+                &["batch-get-collection-group"],
+                0,
+                r#"{"collectionGroupDetails":[{"id":"grp789","name":"cg-ma-demo-target"}]}"#,
+            )
+            .stub(
+                "aws",
+                &["batch-get-collection"],
+                0,
+                r#"{"collectionDetails":[{"status":"ACTIVE","id":"colid123","collectionEndpoint":"https://x.aoss.us-east-1.on.aws"}]}"#,
+            );
         let w = ScriptWizard::new();
         let code = dispatch(
             &args(&["destroy", "--workspace", ws.to_str().unwrap()]),
@@ -1120,6 +1303,10 @@ mod tests {
         // Deleted the policies too.
         assert!(r.any_call_contains("delete-security-policy"));
         assert!(r.any_call_contains("delete-access-policy"));
+        // And tore down the NextGen collection group by its resolved ID (it does
+        // not auto-GC, so leaving it would keep billing).
+        assert!(r.any_call_contains("delete-collection-group --region"));
+        assert!(r.any_call_contains("--id grp789"));
         assert!(!ws.exists());
     }
 

@@ -60,6 +60,18 @@ pub fn rows(current: Step) -> Vec<Row> {
         .collect()
 }
 
+/// The timeline as plain text (one line per phase, `marker label`), for the
+/// stdout provisioning path where there's no Ratatui Frame. Pure, so the
+/// roadmap content is unit-testable. Callers print it (e.g. via `ui::dim`) once
+/// at the start of provisioning so the operator sees the full sequence up front.
+pub fn plain(current: Step) -> String {
+    rows(current)
+        .iter()
+        .map(|r| format!("  {} {}", r.status.marker(), r.label))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Render the timeline into `frame` for the given current step.
 pub fn render(frame: &mut Frame, current: Step, title: &str) {
     let lines: Vec<Line> = rows(current)
@@ -118,6 +130,16 @@ mod tests {
         assert_eq!(PhaseStatus::Done.marker(), '●');
         assert_eq!(PhaseStatus::Current.marker(), '◐');
         assert_eq!(PhaseStatus::Pending.marker(), '○');
+    }
+
+    #[test]
+    fn plain_lists_all_phases_with_markers() {
+        let p = plain(Step::Planned);
+        // One line per phase, first is Current (◐), rest Pending (○).
+        assert!(p.contains("◐ Plan collected"));
+        assert!(p.contains("○ Source cluster"));
+        assert!(p.contains("○ Launch Migration Assistant"));
+        assert_eq!(p.lines().count(), Step::ORDER.len());
     }
 
     #[test]
