@@ -109,6 +109,7 @@ fn run<R: CommandRunner, W: Wizardish>(args: &[String], runner: &R, wiz: &W) -> 
         // `plan` collects answers + prints the plan but provisions nothing.
         Some("plan") => cmd_run(runner, wiz, &rest, true),
         Some("clear") => cmd_clear(&rest),
+        Some("destroy") => cmd_destroy(runner, &rest),
         Some("version") | Some("--version") | Some("-V") => {
             println!("{VERSION}");
             Ok(())
@@ -275,6 +276,45 @@ fn cmd_clear(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `destroy` — delete the harness's local KIND clusters (source + target) and
+/// then wipe the workspace. The local counterpart to MA's own `cleanup`; for
+/// the cloud path the operator runs `terraform destroy` on the emitted module.
+fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
+    let flags = parse_flags(args);
+    let workspace = flags
+        .workspace
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_workspace);
+    let answers = Answers::new();
+    ui::banner("Destroy local demo environment");
+
+    if !runner.has_command("kind") {
+        ui::warn("kind not on PATH; skipping cluster deletion");
+    } else {
+        for cluster in [answers.source_cluster(), answers.target_cluster()] {
+            ui::step(&format!("kind delete cluster {cluster}"));
+            // Idempotent: kind exits 0 (with a notice) when the cluster is absent.
+            let out = runner.run("kind", &["delete", "cluster", "--name", &cluster]);
+            if out.success() {
+                ui::ok(&format!("{cluster} deleted"));
+            } else {
+                ui::warn(&format!(
+                    "could not delete {cluster}: {}",
+                    out.stderr.trim()
+                ));
+            }
+        }
+    }
+
+    if workspace.exists() {
+        std::fs::remove_dir_all(&workspace)?;
+        ui::ok("workspace cleared");
+    }
+    ui::dim("  (cloud) for an AWS deploy, run `terraform destroy` in terraform/");
+    Ok(())
+}
+
 /// Print the human plan summary (the review screen's text form).
 pub fn print_plan(a: &Answers) {
     ui::info(&format!("  {}", a.summary()));
@@ -340,6 +380,7 @@ Usage:\n\
 \x20 ma-demo run [flags]        Same as default\n\
 \x20 ma-demo plan [flags]       Collect answers + print the plan; provision nothing\n\
 \x20 ma-demo clear [flags]      Wipe the local workspace (no Docker/cloud changes)\n\
+\x20 ma-demo destroy [flags]    Delete the local KIND clusters + wipe the workspace\n\
 \x20 ma-demo version            Print version\n\
 \x20 ma-demo help               This help\n\n\
 Flags:\n\
@@ -545,6 +586,43 @@ mod tests {
             &w,
         );
         assert_eq!(code, 0);
+        assert!(!ws.exists());
+    }
+
+    #[test]
+    fn destroy_deletes_both_clusters_and_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("plan.json"), "{}").unwrap();
+        let r = MockRunner::new().with_command("kind");
+        let w = ScriptWizard::new();
+        let code = dispatch(
+            &args(&["destroy", "--workspace", ws.to_str().unwrap()]),
+            &r,
+            &w,
+        );
+        assert_eq!(code, 0);
+        // Both clusters deleted, workspace gone.
+        assert!(r.any_call_contains("kind delete cluster --name ma-demo-source"));
+        assert!(r.any_call_contains("kind delete cluster --name ma-demo-target"));
+        assert!(!ws.exists());
+    }
+
+    #[test]
+    fn destroy_without_kind_skips_cluster_deletion_gracefully() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let r = MockRunner::new(); // no kind on PATH
+        let w = ScriptWizard::new();
+        let code = dispatch(
+            &args(&["destroy", "--workspace", ws.to_str().unwrap()]),
+            &r,
+            &w,
+        );
+        assert_eq!(code, 0);
+        assert!(!r.any_call_contains("kind delete"));
         assert!(!ws.exists());
     }
 

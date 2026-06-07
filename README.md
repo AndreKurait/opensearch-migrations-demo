@@ -74,6 +74,7 @@ ma-demo [flags]            Run the wizard, provision, launch MA (default)
 ma-demo run [flags]        Same as default
 ma-demo plan [flags]       Collect answers + print the plan; provision nothing
 ma-demo clear [flags]      Wipe the local workspace (no Docker/cloud changes)
+ma-demo destroy [flags]    Delete the local KIND clusters + wipe the workspace
 ma-demo version
 ma-demo help
 
