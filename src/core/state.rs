@@ -120,9 +120,6 @@ impl State {
             return Ok(());
         }
         let text = std::fs::read_to_string(&path)?;
-        if text.trim().is_empty() {
-            return Ok(());
-        }
         // A corrupt plan.json gets an actionable message naming the file + the
         // fix, rather than the bare serde "expected value at line N" (which the
         // blanket From<serde_json::Error> would produce).
@@ -206,6 +203,25 @@ mod tests {
             "got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn existing_empty_plan_is_an_error_and_does_not_replace_memory() {
+        for contents in ["", " \n\t\r\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut state = State::new(tmp.path());
+            state.plan.answers.target = Some(Target::Cloud);
+            let before = state.plan.clone();
+            std::fs::write(state.plan_path(), contents).unwrap();
+
+            let error = state.load().unwrap_err();
+            assert!(error.message.contains("Preserve this workspace"));
+            assert_eq!(state.plan, before);
+            assert_eq!(
+                std::fs::read_to_string(state.plan_path()).unwrap(),
+                contents
+            );
+        }
     }
 
     #[test]

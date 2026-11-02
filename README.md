@@ -167,6 +167,8 @@ Flags:
 
 `ma-demo destroy` deletes the local KIND clusters and removes the workspace only when local cleanup succeeds. If KIND is unavailable or deletion fails, it exits with an error and retains the workspace for retry. For an AOSS target it submits deletion requests, reports failed requests, and retains the plan because AWS deletion can continue asynchronously. Verify the collection, group, and policies are gone before manually removing that workspace.
 
+AOSS cleanup validates both collection and group lookups before issuing cloud deletes. Missing IDs, malformed responses, and per-item errors stop cleanup; only an explicit `NOT_FOUND` lookup result confirms absence. Retries accept the AWS CLI's exact `ResourceNotFoundException` error for the requested delete operation. An existing empty or whitespace-only plan is invalid and is preserved for recovery.
+
 Terraform teardown remains explicit: run `terraform destroy` from the workspace's `terraform/` directory using the deployment's account, profile, and region. Review its plan and verify the resources are gone before deleting the workspace. Neither `clear` nor `destroy` removes Terraform configuration or state.
 
 These checks protect the harness's known workspace layout; they do not discover infrastructure created elsewhere or guarantee cloud cleanup from a successful API response.

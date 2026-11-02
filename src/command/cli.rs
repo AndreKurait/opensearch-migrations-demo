@@ -10,7 +10,7 @@ use crate::app::{App, Progress};
 use crate::error::{Error, Result};
 use crate::model::Answers;
 use crate::plan::ProvisionPlan;
-use crate::runner::CommandRunner;
+use crate::runner::{CommandRunner, Output};
 use crate::state::State;
 use crate::tui::{Outcome, ReviewContext, ReviewOutcome};
 use crate::wizard::{self, QuestionId};
@@ -692,8 +692,8 @@ fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
 }
 
 /// Tear down an AOSS NextGen target in reverse-dependency order: collection →
-/// policies → collection group. Best-effort + idempotent — missing resources are
-/// reported to the caller. The workspace is retained because cloud deletion can
+/// policies → collection group. Both lookups must succeed before cloud changes;
+/// only explicit NOT_FOUND results establish absence. The workspace is retained because cloud deletion can
 /// be asynchronous. The region + profile come from
 /// the saved plan (via the exported AWS env), so teardown targets the same
 /// account/region the create used — not whatever the ambient env happens to be.
@@ -707,22 +707,60 @@ fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) -> bool {
     crate::app::export_aws_env(answers);
     let collection = answers.aoss_collection_name();
     let region = answers.effective_aws_region();
-    ui::step(&format!("delete AOSS collection {collection}"));
+    ui::step(&format!(
+        "inspect AOSS collection {collection} and its group"
+    ));
 
-    // Resolve the collection ID from its name (delete-collection wants the ID).
+    // Resolve both IDs before deleting anything: HTTP success can still contain
+    // per-item lookup errors, and a missing ID alone does not establish absence.
     let bg = crate::plan::aoss_batch_get_args(&collection, region);
     let bg_ref: Vec<&str> = bg.iter().map(String::as_str).collect();
     let out = runner.run("aws", &bg_ref);
-    if !out.success() || serde_json::from_str::<serde_json::Value>(&out.stdout).is_err() {
+    if !out.success() {
         ui::warn("could not inspect the AOSS collection; workspace will be preserved");
         return false;
     }
+    let collection_id = match inspect_aoss_resource(
+        &out.stdout,
+        "collectionDetails",
+        "collectionErrorDetails",
+        &collection,
+    ) {
+        Ok(id) => id,
+        Err(error) => {
+            ui::warn(&format!("could not inspect the AOSS collection: {error}"));
+            return false;
+        }
+    };
+    let group = crate::plan::aoss_group_name(&collection);
+    let gg = crate::plan::aoss_batch_get_group_args(&collection, region);
+    let gg_ref: Vec<&str> = gg.iter().map(String::as_str).collect();
+    let gout = runner.run("aws", &gg_ref);
+    if !gout.success() {
+        ui::warn("could not inspect the AOSS collection group; workspace will be preserved");
+        return false;
+    }
+    let group_id = match inspect_aoss_resource(
+        &gout.stdout,
+        "collectionGroupDetails",
+        "collectionGroupErrorDetails",
+        &group,
+    ) {
+        Ok(id) => id,
+        Err(error) => {
+            ui::warn(&format!(
+                "could not inspect the AOSS collection group: {error}"
+            ));
+            return false;
+        }
+    };
+
     let mut succeeded = true;
-    if let Some(id) = parse_aoss_id(&out.stdout) {
+    if let Some(id) = collection_id {
         let del = crate::plan::aoss_delete_collection_args(&id, region);
         let del_ref: Vec<&str> = del.iter().map(String::as_str).collect();
         let r = runner.run("aws", &del_ref);
-        if r.success() {
+        if aoss_delete_succeeded(&r, "DeleteCollection") {
             ui::ok(&format!("collection {collection} deletion requested"));
         } else {
             succeeded = false;
@@ -740,7 +778,7 @@ fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) -> bool {
         let a = crate::plan::aoss_delete_security_policy_args(&name, ptype, region);
         let aref: Vec<&str> = a.iter().map(String::as_str).collect();
         let out = runner.run("aws", &aref);
-        if !out.success() {
+        if !aoss_delete_succeeded(&out, "DeleteSecurityPolicy") {
             ui::warn(&format!(
                 "policy {name} deletion failed: {}",
                 out.stderr.trim()
@@ -751,7 +789,7 @@ fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) -> bool {
     let dp = crate::plan::aoss_delete_access_policy_args(&format!("{collection}-data"), region);
     let dpref: Vec<&str> = dp.iter().map(String::as_str).collect();
     let out = runner.run("aws", &dpref);
-    if !out.success() {
+    if !aoss_delete_succeeded(&out, "DeleteAccessPolicy") {
         ui::warn(&format!(
             "data policy deletion failed: {}",
             out.stderr.trim()
@@ -760,19 +798,12 @@ fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) -> bool {
     }
 
     // The collection group does NOT auto-GC once empty — delete it explicitly,
-    // or it lingers as a billable NextGen group. Resolve its ID then delete.
-    let gg = crate::plan::aoss_batch_get_group_args(&collection, region);
-    let gg_ref: Vec<&str> = gg.iter().map(String::as_str).collect();
-    let gout = runner.run("aws", &gg_ref);
-    if !gout.success() || serde_json::from_str::<serde_json::Value>(&gout.stdout).is_err() {
-        ui::warn("could not inspect the AOSS collection group; workspace will be preserved");
-        return false;
-    }
-    if let Some(gid) = parse_aoss_group_id(&gout.stdout) {
+    // or it lingers as a billable NextGen group. Its ID was resolved in preflight.
+    if let Some(gid) = group_id {
         let dg = crate::plan::aoss_delete_collection_group_args(&gid, region);
         let dg_ref: Vec<&str> = dg.iter().map(String::as_str).collect();
         let r = runner.run("aws", &dg_ref);
-        if r.success() {
+        if aoss_delete_succeeded(&r, "DeleteCollectionGroup") {
             ui::ok(&format!(
                 "collection group {} deletion requested",
                 crate::plan::aoss_group_name(&collection)
@@ -792,18 +823,72 @@ fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) -> bool {
     succeeded
 }
 
-/// Parse the collection ID out of a `batch-get-collection` response (any status).
-fn parse_aoss_id(json: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let details = v.get("collectionDetails")?.as_array()?;
-    details.first()?.get("id")?.as_str().map(|s| s.to_string())
+/// Interpret one name-based batch lookup. Empty, mixed, or unrelated results
+/// are ambiguous and must never authorize deletion of dependent resources.
+fn inspect_aoss_resource(
+    json: &str,
+    details_key: &str,
+    errors_key: &str,
+    expected_name: &str,
+) -> Result<Option<String>> {
+    let response: serde_json::Value = serde_json::from_str(json)?;
+    if !response.is_object() {
+        return Err(Error::die("batch lookup response must be a JSON object"));
+    }
+    let array = |key: &str| -> Result<&[serde_json::Value]> {
+        match response.get(key) {
+            Some(serde_json::Value::Array(values)) => Ok(values.as_slice()),
+            None => Ok(&[]),
+            _ => Err(Error::die(format!("batch lookup {key} must be an array"))),
+        }
+    };
+    match (array(details_key)?, array(errors_key)?) {
+        ([detail], []) => {
+            if detail.get("name").and_then(serde_json::Value::as_str) != Some(expected_name) {
+                return Err(Error::die(
+                    "batch lookup did not identify the requested resource",
+                ));
+            }
+            let id = detail
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty() && id.trim() == *id)
+                .ok_or_else(|| {
+                    Error::die("batch lookup returned a missing or invalid resource ID")
+                })?;
+            Ok(Some(id.to_string()))
+        }
+        ([], [error]) => {
+            if error.get("name").and_then(serde_json::Value::as_str) != Some(expected_name) {
+                return Err(Error::die(
+                    "batch lookup error did not identify the requested resource",
+                ));
+            }
+            if error.get("errorCode").and_then(serde_json::Value::as_str) == Some("NOT_FOUND") {
+                Ok(None)
+            } else {
+                Err(Error::die(
+                    "batch lookup reported a resource error other than NOT_FOUND",
+                ))
+            }
+        }
+        _ => Err(Error::die(
+            "batch lookup did not return exactly one unambiguous resource result",
+        )),
+    }
 }
 
-/// Parse the group ID out of a `batch-get-collection-group` response.
-fn parse_aoss_group_id(json: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let details = v.get("collectionGroupDetails")?.as_array()?;
-    details.first()?.get("id")?.as_str().map(|s| s.to_string())
+/// The AWS CLI's exact service-error header distinguishes confirmed absence
+/// from access errors or arbitrary messages that happen to say "not found".
+fn aoss_delete_succeeded(output: &Output, operation: &str) -> bool {
+    output.success()
+        || output
+            .stderr
+            .trim()
+            .strip_prefix(&format!(
+                "An error occurred (ResourceNotFoundException) when calling the {operation} operation: "
+            ))
+            .is_some_and(|message| !message.trim().is_empty() && !message.contains('\n'))
 }
 
 /// Print the human plan summary (the review screen's text form).
@@ -1389,7 +1474,7 @@ mod tests {
                 "aws",
                 &["batch-get-collection"],
                 0,
-                r#"{"collectionDetails":[{"status":"ACTIVE","id":"colid123","collectionEndpoint":"https://x.aoss.us-east-1.on.aws"}]}"#,
+                r#"{"collectionDetails":[{"status":"ACTIVE","id":"colid123","name":"ma-demo-target","collectionEndpoint":"https://x.aoss.us-east-1.on.aws"}]}"#,
             );
         let w = ScriptWizard::new();
         let code = dispatch(
