@@ -209,8 +209,8 @@ jobs:
           set -euo pipefail
           # Include drafts in the authenticated, paginated check. Lookup errors
           # stop publication; no existing release or asset is ever overwritten.
-          existing="$(gh api --paginate --slurp "repos/$GH_REPO/releases" \
-            --jq ".[][] | select(.tag_name == \"$RELEASE_TAG\") | .id")"
+          existing="$(gh api --paginate "repos/$GH_REPO/releases" \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .id")"
           [[ -z "$existing" ]] || { echo "::error::release already exists"; exit 1; }
           current="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
           [[ "$current" == "$RELEASE_COMMIT" ]] || { echo "::error::release tag moved"; exit 1; }
