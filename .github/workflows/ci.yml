@@ -13,6 +13,13 @@ permissions:
   contents: read
 
 jobs:
+  installer:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline installer regressions
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
   # Fast feedback: format + lints. Fails on any rustfmt diff or clippy warning.
   lint:
     runs-on: ubuntu-22.04

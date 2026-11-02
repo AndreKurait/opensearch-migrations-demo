@@ -80,10 +80,15 @@ cargo run -- --non-interactive
 cargo run -- plan
 ```
 
-The harness writes everything under `./migration-demo-workspace/` (one
-removable folder): the saved plan (`plan.json`), every rendered manifest + KIND
+The harness writes its local files under `./migration-demo-workspace/`: the saved plan (`plan.json`), every rendered manifest + KIND
 config, the emitted Terraform, and the installed `migration-assistant` binary
-under `bin/`. Re-running resumes from the saved plan.
+under `bin/`. Re-running resumes from the saved plan. Keep cloud workspaces until teardown has been verified: they contain Terraform state and deployment metadata, and deleting the directory does not delete AWS resources.
+
+### Installer verification
+
+Installation requires `curl`, `tar`, and either `shasum` or `sha256sum`. The installer requires a matching SHA-256 sidecar and the exact target-specific archive member; missing or invalid checksums and unexpected archive contents abort before replacing an existing binary. Checksums come from the same GitHub release as the archive and are an integrity check, not an independent publisher signature.
+
+Pin a release with `MA_DEMO_VERSION=vX.Y.Z` and choose a directory with `BIN_DIR`. Manual release builds resolve the requested tag once and use that commit for both platform binaries and `install.sh`.
 
 ## What it asks
 
@@ -145,8 +150,8 @@ Override non-interactively with `--ma-handoff deploy-local-helm|install-cli`.
 ma-demo [flags]            Run the wizard, provision, launch MA (default)
 ma-demo run [flags]        Same as default
 ma-demo plan [flags]       Collect answers + print the plan; provision nothing
-ma-demo clear [flags]      Wipe the local workspace (no Docker/cloud changes)
-ma-demo destroy [flags]    Delete the local KIND clusters + wipe the workspace
+ma-demo clear [flags]      Remove a local-only workspace; preserve cloud metadata
+ma-demo destroy [flags]    Delete KIND clusters; retain cloud or failed-cleanup state
 ma-demo version
 ma-demo help
 
@@ -155,6 +160,18 @@ Flags:
   --dry-run, --plan        Stop after printing the plan.
   --workspace DIR          Workspace dir (default ./migration-demo-workspace).
 ```
+
+## Cleanup and retained state
+
+`ma-demo clear` removes a local-only workspace without deleting resources. It refuses to discard Terraform files, a saved cloud/AOSS plan, or an unreadable plan.
+
+`ma-demo destroy` deletes the local KIND clusters and removes the workspace only when local cleanup succeeds. If KIND is unavailable or deletion fails, it exits with an error and retains the workspace for retry. For an AOSS target it submits deletion requests, reports failed requests, and retains the plan because AWS deletion can continue asynchronously. Verify the collection, group, and policies are gone before manually removing that workspace.
+
+AOSS cleanup validates both collection and group lookups before issuing cloud deletes. Missing IDs, malformed responses, and per-item errors stop cleanup; only an explicit `NOT_FOUND` lookup result confirms absence. Retries accept the AWS CLI's exact `ResourceNotFoundException` error for the requested delete operation. An existing empty or whitespace-only plan is invalid and is preserved for recovery.
+
+Terraform teardown remains explicit: run `terraform destroy` from the workspace's `terraform/` directory using the deployment's account, profile, and region. Review its plan and verify the resources are gone before deleting the workspace. Neither `clear` nor `destroy` removes Terraform configuration or state.
+
+These checks protect the harness's known workspace layout; they do not discover infrastructure created elsewhere or guarantee cloud cleanup from a successful API response.
 
 ## How the local path works (multiple KIND clusters)
 
@@ -190,7 +207,8 @@ and launches it. From there the Migration Assistant drives the migration itself
 ## Development
 
 ```sh
-cargo test                              # full unit + integration suite
+python3 -m unittest discover -s tests -p 'test_*.py'  # offline installer fixtures
+cargo test --locked                     # full unit + integration suite
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo build --release

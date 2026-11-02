@@ -750,6 +750,8 @@ pub fn export_aws_env(answers: &Answers) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These three chart-resolution tests mutate the same process environment.
+    static CHART_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use crate::model::{ClientApp, SnapshotStorage, SourceEngine, TargetMode};
     use crate::runner::MockRunner;
 
@@ -943,6 +945,7 @@ mod tests {
 
     #[test]
     fn deploy_ma_local_creates_cluster_helm_installs_and_execs_console() {
+        let _chart_env = CHART_ENV_LOCK.lock().unwrap();
         // Point MA_CHART_PATH at a real temp dir so chart resolution succeeds.
         let chart = tempfile::tempdir().unwrap();
         std::env::set_var("MA_CHART_PATH", chart.path());
@@ -970,6 +973,7 @@ mod tests {
 
     #[test]
     fn deploy_ma_local_without_helm_errors() {
+        let _chart_env = CHART_ENV_LOCK.lock().unwrap();
         let chart = tempfile::tempdir().unwrap();
         std::env::set_var("MA_CHART_PATH", chart.path());
         let r = ready_runner(); // no helm registered
@@ -983,6 +987,7 @@ mod tests {
 
     #[test]
     fn deploy_ma_local_missing_chart_errors() {
+        let _chart_env = CHART_ENV_LOCK.lock().unwrap();
         std::env::set_var("MA_CHART_PATH", "/nonexistent/chart/path/xyz");
         let r = ready_runner().with_command("helm");
         let tmp = tempfile::tempdir().unwrap();
