@@ -203,11 +203,31 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           RELEASE_VERSION: ${{ needs.resolve.outputs.stripped }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
         shell: bash
         run: |
-          # Creation fails if this tag already has a release: never overwrite
-          # published assets. An interrupted upload remains an unpublished draft.
-          gh release create "$RELEASE_TAG" --verify-tag --draft \
-            --title "$RELEASE_TAG" --notes-file "docs/releases/${RELEASE_VERSION}.md" \
-            release-assets/*
-          gh release edit "$RELEASE_TAG" --draft=false --latest
+          set -euo pipefail
+          # Include drafts in the authenticated, paginated check. Lookup errors
+          # stop publication; no existing release or asset is ever overwritten.
+          existing="$(gh api --paginate --slurp "repos/$GH_REPO/releases" \
+            --jq ".[][] | select(.tag_name == \"$RELEASE_TAG\") | .id")"
+          [[ -z "$existing" ]] || { echo "::error::release already exists"; exit 1; }
+          current="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
+          [[ "$current" == "$RELEASE_COMMIT" ]] || { echo "::error::release tag moved"; exit 1; }
+          release_id="$(gh api --method POST "repos/$GH_REPO/releases" \
+            -f tag_name="$RELEASE_TAG" -f name="$RELEASE_TAG" \
+            -f body="$(cat "docs/releases/${RELEASE_VERSION}.md")" \
+            -F draft=true -F prerelease=false --jq .id)"
+          [[ "$release_id" =~ ^[0-9]+$ ]] || { echo "::error::invalid release ID"; exit 1; }
+          for asset in release-assets/*; do
+            gh api --method POST \
+              "https://uploads.github.com/repos/$GH_REPO/releases/$release_id/assets?name=${asset##*/}" \
+              --header 'Content-Type: application/octet-stream' \
+              --input "$asset" > /dev/null
+          done
+          current="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
+          [[ "$current" == "$RELEASE_COMMIT" ]] || { echo "::error::release tag moved"; exit 1; }
+          # Use the new draft's exact ID, so tag lookup cannot select a different
+          # draft. A failed upload leaves this release unpublished for inspection.
+          gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+            -F draft=false -f make_latest=true > /dev/null
