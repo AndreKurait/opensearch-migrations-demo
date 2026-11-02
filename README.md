@@ -90,6 +90,10 @@ Installation requires `curl`, `tar`, and either `shasum` or `sha256sum`. The ins
 
 Pin a release with `MA_DEMO_VERSION=vX.Y.Z` and choose a directory with `BIN_DIR`. Manual release builds resolve the requested tag once and use that commit for both platform binaries and `install.sh`.
 
+Release builds stage all four platform archives before publication. Checksums,
+archive contents, and the complete asset set must pass validation before the
+draft release becomes public. See [release instructions](RELEASING.md).
+
 ## What it asks
 
 | Question | Choices |

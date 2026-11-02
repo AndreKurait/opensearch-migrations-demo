@@ -1,6 +1,6 @@
 [package]
 name = "migration-assistant-demo"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2021"
 # Build/test against 1.96.0 (see rust-toolchain.toml). Above every dependency
 # floor (ratatui 0.30 needs >=1.88).
