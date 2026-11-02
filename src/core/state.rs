@@ -128,8 +128,8 @@ impl State {
         // blanket From<serde_json::Error> would produce).
         self.plan = serde_json::from_str(&text).map_err(|e| {
             Error::die(format!(
-                "could not parse the saved plan at {} ({e}). Reset it with `ma-demo clear` \
-                 (this only wipes the local workspace, not any provisioned resources).",
+                "could not parse the saved plan at {} ({e}). Preserve this workspace and \
+                 recover plan.json from a backup; it may contain metadata needed for cloud teardown.",
                 path.display()
             ))
         })?;
@@ -202,7 +202,7 @@ mod tests {
         // Names the file and the fix instead of a bare serde line/column message.
         assert!(err.message.contains("plan.json"), "got: {}", err.message);
         assert!(
-            err.message.contains("ma-demo clear"),
+            err.message.contains("Preserve this workspace"),
             "got: {}",
             err.message
         );

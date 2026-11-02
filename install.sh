@@ -34,14 +34,15 @@ require() { command -v "$1" >/dev/null 2>&1 || die "required command not on PATH
 # Module-scoped temp dir; the EXIT trap (set once, here) cleans it whether we
 # succeed or die. Declared before main() so it's in scope under `set -u`.
 tmp=""
-trap '[[ -n "$tmp" ]] && rm -rf "$tmp"' EXIT
+staged=""
+trap '[[ -z "$tmp" ]] || rm -rf "$tmp"; [[ -z "$staged" ]] || rm -f "$staged"' EXIT
 
 require uname
 require tar
 
 # --- sha256 of a file, as a bare lowercase hex digest (portable) ---
-# Prefers shasum (always on macOS), falls back to sha256sum (Linux). Returns
-# empty if neither exists — the caller decides whether that's fatal.
+# Prefers shasum (macOS), falls back to sha256sum (Linux). Verification is
+# mandatory: a missing tool must never turn a verified install into an unchecked one.
 sha256_of() {
   local f="$1"
   if command -v shasum >/dev/null 2>&1; then
@@ -49,7 +50,7 @@ sha256_of() {
   elif command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$f" | awk '{print $1}'
   else
-    printf ''
+    die "required checksum tool not on PATH: shasum or sha256sum"
   fi
 }
 
@@ -90,6 +91,8 @@ resolve_version() {
 
 main() {
   require curl
+  command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1 \
+    || die "required checksum tool not on PATH: shasum or sha256sum"
   printf 'Installing %s…\n\n' "$(c_bold ma-demo)"
 
   # `tmp` is intentionally NOT local — it's the module global the EXIT trap
@@ -114,35 +117,37 @@ main() {
   # Verify the published SHA-256 before trusting the archive (supply-chain
   # integrity). Every release ships a "<tarball>.sha256" alongside the tarball.
   # The local digest tool is the same shasum/sha256sum the release used.
-  local local_sum expected_sum
+  local local_sum expected_sum checksum_line checksum_name extra
   local_sum="$(sha256_of "$tmp/$tarball")"
-  if [[ -z "$local_sum" ]]; then
-    printf '%s no sha256 tool (shasum/sha256sum) found; skipping checksum verification\n' \
-      "$(c_yellow '!')"
-  elif expected_sum="$(curl -fsSL --max-time 30 "${url}.sha256" 2>/dev/null | awk '{print $1}')" \
-       && [[ -n "$expected_sum" ]]; then
-    if [[ "$local_sum" != "$expected_sum" ]]; then
-      die "checksum mismatch for $tarball
+  checksum_line="$(curl -fsSL --max-time 30 "${url}.sha256")" \
+    || die "could not download required checksum ${tarball}.sha256"
+  [[ "$checksum_line" != *$'\n'* ]] || die "checksum must contain exactly one entry"
+  read -r expected_sum checksum_name extra <<< "$checksum_line"
+  [[ "$expected_sum" =~ ^[0-9a-f]{64}$ && "$checksum_name" == "$tarball" && -z "$extra" ]] \
+    || die "invalid checksum entry for $tarball"
+  if [[ "$local_sum" != "$expected_sum" ]]; then
+    die "checksum mismatch for $tarball
     expected: $expected_sum
     actual:   $local_sum
   The download may be corrupt or tampered with — aborting."
-    fi
-    printf '  %s %s\n' "$(c_dim 'sha256:')" "$(c_green 'verified')"
-  else
-    printf '%s could not fetch %s; skipping checksum verification\n' \
-      "$(c_yellow '!')" "${tarball}.sha256"
   fi
+  printf '  %s %s\n' "$(c_dim 'sha256:')" "$(c_green 'verified')"
 
-  tar -xzf "$tmp/$tarball" -C "$tmp"
-
-  # The tarball contains a single binary named ma-demo-<target>; install it as
-  # `ma-demo`.
-  local extracted="$tmp/${BIN_NAME}-${target}"
-  [[ -f "$extracted" ]] || extracted="$(find "$tmp" -type f -name "${BIN_NAME}*" ! -name '*.tar.gz' | head -1)"
-  [[ -f "$extracted" ]] || die "release tarball did not contain a ma-demo binary"
+  # Releases contain exactly one target-specific binary. Reject other layouts
+  # instead of guessing. Extract to stdout so archive paths and links cannot
+  # write anywhere on disk.
+  local member="${BIN_NAME}-${target}" entries extracted="$tmp/binary"
+  entries="$(tar -tzf "$tmp/$tarball")" || die "could not read release archive"
+  [[ "$entries" == "$member" ]] || die "release archive must contain only $member"
+  tar -xOzf "$tmp/$tarball" "$member" > "$extracted" \
+    || die "could not extract $member"
+  [[ -s "$extracted" ]] || die "release binary is empty or is not a regular file"
 
   mkdir -p "$BIN_DIR"
-  install -m 0755 "$extracted" "$BIN_DIR/$BIN_NAME"
+  staged="$(mktemp "$BIN_DIR/.ma-demo.XXXXXX")"
+  install -m 0755 "$extracted" "$staged"
+  mv -f "$staged" "$BIN_DIR/$BIN_NAME"
+  staged=""
 
   printf '%s %s %s installed → %s\n\n' \
     "$(c_green '✔')" "$BIN_NAME" "$version" "$BIN_DIR/$BIN_NAME"

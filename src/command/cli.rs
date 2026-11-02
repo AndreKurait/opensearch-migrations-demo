@@ -15,7 +15,7 @@ use crate::state::State;
 use crate::tui::{Outcome, ReviewContext, ReviewOutcome};
 use crate::wizard::{self, QuestionId};
 use crate::{dashboard, terraform, ui};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The harness version: the `DEMO_VERSION` env stamped by build.rs at release
 /// build time (set from the git tag), or a dev default for a plain `cargo build`.
@@ -570,7 +570,29 @@ fn preselect_for(id: QuestionId, a: &Answers) -> Vec<String> {
     }
 }
 
-/// `clear` — wipe the local workspace (no Docker/cloud changes).
+/// Load cleanup metadata before deleting anything. Terraform configuration and
+/// state must stay available for the operator's explicit cloud teardown.
+fn cleanup_state(workspace: &Path) -> Result<State> {
+    if workspace.join("terraform").exists() {
+        return Err(Error::die(format!(
+            "workspace preserved: {} contains Terraform configuration or state. \
+             Run `terraform destroy` in its terraform directory, verify cloud cleanup, \
+             then remove the workspace manually.",
+            workspace.display()
+        )));
+    }
+    let mut state = State::new(workspace);
+    state.load()?;
+    if state.plan.answers.target == Some(crate::model::Target::Cloud) {
+        return Err(Error::die(
+            "workspace preserved: its saved plan uses Terraform cloud resources. \
+             Complete and verify cloud teardown before removing the workspace manually.",
+        ));
+    }
+    Ok(state)
+}
+
+/// `clear` — wipe a local-only workspace (no Docker/cloud changes).
 fn cmd_clear(args: &[String]) -> Result<()> {
     let flags = parse_flags(args)?;
     let workspace = flags
@@ -582,6 +604,13 @@ fn cmd_clear(args: &[String]) -> Result<()> {
     if !workspace.exists() {
         ui::info("nothing to clear");
         return Ok(());
+    }
+    let state = cleanup_state(&workspace)?;
+    if state.plan.answers.provisions_aoss_target() {
+        return Err(Error::die(
+            "workspace preserved: its saved plan includes an AOSS target. \
+             Run `ma-demo destroy` and verify cloud cleanup before removing the workspace manually.",
+        ));
     }
     std::fs::remove_dir_all(&workspace)?;
     ui::ok("workspace cleared");
@@ -601,13 +630,14 @@ fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
     let answers = Answers::new();
     ui::banner("Destroy local demo environment");
 
-    // Load the saved plan (if any) to see whether an AOSS target was provisioned.
-    let mut state = State::new(&workspace);
-    let _ = state.load();
+    // Never discard state after an unreadable plan or a Terraform deployment.
+    let state = cleanup_state(&workspace)?;
     let provisioned_aoss = state.plan.answers.provisions_aoss_target();
+    let mut cleanup_failed = false;
 
     if !runner.has_command("kind") {
         ui::warn("kind not on PATH; skipping cluster deletion");
+        cleanup_failed = true;
     } else {
         // Source, target, and the dedicated MA cluster (local helm deploy).
         for cluster in [
@@ -626,6 +656,7 @@ fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
             if out.success() {
                 ui::ok(&format!("{cluster} deleted"));
             } else {
+                cleanup_failed = true;
                 ui::warn(&format!(
                     "could not delete {cluster}: {}",
                     out.stderr.trim()
@@ -638,26 +669,38 @@ fn cmd_destroy<R: CommandRunner>(runner: &R, args: &[String]) -> Result<()> {
     // was provisioned and the aws CLI is available. The saved plan supplies the
     // profile + region so teardown hits the same account/region the create did.
     if provisioned_aoss {
-        destroy_aoss(runner, &state.plan.answers);
+        cleanup_failed |= !destroy_aoss(runner, &state.plan.answers);
+    }
+    if cleanup_failed {
+        return Err(Error::die(
+            "cleanup did not complete; workspace preserved so teardown can be retried.",
+        ));
+    }
+    if provisioned_aoss {
+        ui::warn(
+            "AOSS deletion requests submitted; workspace preserved. Verify that the collection, \
+             group, and policies are gone before removing it manually.",
+        );
+        return Ok(());
     }
 
     if workspace.exists() {
         std::fs::remove_dir_all(&workspace)?;
         ui::ok("workspace cleared");
     }
-    ui::dim("  (cloud) for a Terraform deploy, run `terraform destroy` in terraform/");
     Ok(())
 }
 
 /// Tear down an AOSS NextGen target in reverse-dependency order: collection →
 /// policies → collection group. Best-effort + idempotent — missing resources are
-/// not fatal (the workspace wipe still proceeds). The region + profile come from
+/// reported to the caller. The workspace is retained because cloud deletion can
+/// be asynchronous. The region + profile come from
 /// the saved plan (via the exported AWS env), so teardown targets the same
 /// account/region the create used — not whatever the ambient env happens to be.
-fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) {
+fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) -> bool {
     if !runner.has_command("aws") {
         ui::warn("aws CLI not on PATH; skipping AOSS teardown");
-        return;
+        return false;
     }
     // Export AWS_PROFILE/AWS_REGION from the plan so every `aws` call below hits
     // the right account/region.
@@ -670,13 +713,19 @@ fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) {
     let bg = crate::plan::aoss_batch_get_args(&collection, region);
     let bg_ref: Vec<&str> = bg.iter().map(String::as_str).collect();
     let out = runner.run("aws", &bg_ref);
+    if !out.success() || serde_json::from_str::<serde_json::Value>(&out.stdout).is_err() {
+        ui::warn("could not inspect the AOSS collection; workspace will be preserved");
+        return false;
+    }
+    let mut succeeded = true;
     if let Some(id) = parse_aoss_id(&out.stdout) {
         let del = crate::plan::aoss_delete_collection_args(&id, region);
         let del_ref: Vec<&str> = del.iter().map(String::as_str).collect();
         let r = runner.run("aws", &del_ref);
         if r.success() {
-            ui::ok(&format!("collection {collection} deleted"));
+            ui::ok(&format!("collection {collection} deletion requested"));
         } else {
+            succeeded = false;
             ui::warn(&format!("collection delete: {}", r.stderr.trim()));
         }
     } else {
@@ -690,27 +739,46 @@ fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) {
     ] {
         let a = crate::plan::aoss_delete_security_policy_args(&name, ptype, region);
         let aref: Vec<&str> = a.iter().map(String::as_str).collect();
-        runner.run("aws", &aref);
+        let out = runner.run("aws", &aref);
+        if !out.success() {
+            ui::warn(&format!(
+                "policy {name} deletion failed: {}",
+                out.stderr.trim()
+            ));
+            succeeded = false;
+        }
     }
     let dp = crate::plan::aoss_delete_access_policy_args(&format!("{collection}-data"), region);
     let dpref: Vec<&str> = dp.iter().map(String::as_str).collect();
-    runner.run("aws", &dpref);
+    let out = runner.run("aws", &dpref);
+    if !out.success() {
+        ui::warn(&format!(
+            "data policy deletion failed: {}",
+            out.stderr.trim()
+        ));
+        succeeded = false;
+    }
 
     // The collection group does NOT auto-GC once empty — delete it explicitly,
     // or it lingers as a billable NextGen group. Resolve its ID then delete.
     let gg = crate::plan::aoss_batch_get_group_args(&collection, region);
     let gg_ref: Vec<&str> = gg.iter().map(String::as_str).collect();
     let gout = runner.run("aws", &gg_ref);
+    if !gout.success() || serde_json::from_str::<serde_json::Value>(&gout.stdout).is_err() {
+        ui::warn("could not inspect the AOSS collection group; workspace will be preserved");
+        return false;
+    }
     if let Some(gid) = parse_aoss_group_id(&gout.stdout) {
         let dg = crate::plan::aoss_delete_collection_group_args(&gid, region);
         let dg_ref: Vec<&str> = dg.iter().map(String::as_str).collect();
         let r = runner.run("aws", &dg_ref);
         if r.success() {
             ui::ok(&format!(
-                "collection group {} deleted",
+                "collection group {} deletion requested",
                 crate::plan::aoss_group_name(&collection)
             ));
         } else {
+            succeeded = false;
             // The group can't delete until the collection is fully gone; surface
             // it so the operator can re-run `destroy` once the collection drains.
             ui::warn(&format!(
@@ -721,6 +789,7 @@ fn destroy_aoss<R: CommandRunner>(runner: &R, answers: &Answers) {
     } else {
         ui::dim("  collection group not found (already gone)");
     }
+    succeeded
 }
 
 /// Parse the collection ID out of a `batch-get-collection` response (any status).
@@ -813,9 +882,9 @@ Usage:\n\
 \x20 ma-demo [flags]            Run the wizard, provision, launch MA (default)\n\
 \x20 ma-demo run [flags]        Same as default\n\
 \x20 ma-demo plan [flags]       Collect answers + print the plan; provision nothing\n\
-\x20 ma-demo clear [flags]      Wipe the local workspace (no Docker/cloud changes)\n\
+\x20 ma-demo clear [flags]      Remove a local-only workspace; preserve cloud metadata\n\
 \x20 ma-demo status [flags]     Live, auto-refreshing dashboard of the environment\n\
-\x20 ma-demo destroy [flags]    Delete the local KIND clusters + wipe the workspace\n\
+\x20 ma-demo destroy [flags]    Delete KIND clusters; retain cloud or failed-cleanup state\n\
 \x20 ma-demo version            Print version\n\
 \x20 ma-demo help               This help\n\n\
 Flags:\n\
@@ -1247,7 +1316,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
-        std::fs::write(ws.join("plan.json"), "{}").unwrap();
+        State::new(&ws).save().unwrap();
         let r = MockRunner::new();
         let w = ScriptWizard::new();
         let code = dispatch(
@@ -1264,7 +1333,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
-        std::fs::write(ws.join("plan.json"), "{}").unwrap();
+        State::new(&ws).save().unwrap();
         let r = MockRunner::new().with_command("kind");
         let w = ScriptWizard::new();
         let code = dispatch(
@@ -1280,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn destroy_without_kind_skips_cluster_deletion_gracefully() {
+    fn destroy_without_kind_preserves_workspace_for_retry() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -1291,9 +1360,9 @@ mod tests {
             &r,
             &w,
         );
-        assert_eq!(code, 0);
+        assert_eq!(code, 1);
         assert!(!r.any_call_contains("kind delete"));
-        assert!(!ws.exists());
+        assert!(ws.exists());
     }
 
     #[test]
@@ -1339,7 +1408,10 @@ mod tests {
         // not auto-GC, so leaving it would keep billing).
         assert!(r.any_call_contains("delete-collection-group --region"));
         assert!(r.any_call_contains("--id grp789"));
-        assert!(!ws.exists());
+        assert!(
+            ws.join("plan.json").exists(),
+            "asynchronous AWS teardown must retain its plan"
+        );
     }
 
     #[test]
