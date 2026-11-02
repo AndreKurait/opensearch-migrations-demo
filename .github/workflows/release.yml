@@ -7,6 +7,18 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/verify_release.py"
+      - "tests/test_release.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "build.rs"
+      - "src/**"
+      - "install.sh"
+      - "docs/releases/**"
   workflow_dispatch:
     inputs:
       tag:
@@ -15,6 +27,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   resolve:
@@ -34,18 +50,24 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          [[ "$RELEASE_TAG" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]] || { echo "::error::invalid release tag"; exit 1; }
+          package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            RELEASE_TAG="v$package_version"
+          fi
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::invalid release tag"; exit 1; }
+          version="${RELEASE_TAG#v}"
+          [[ "$version" == "$package_version" ]] || { echo "::error::tag/package version mismatch"; exit 1; }
+          test -s "docs/releases/${version}.md"
           {
             echo "tag=$RELEASE_TAG"
-            echo "stripped=${RELEASE_TAG#v}"
+            echo "stripped=$version"
             echo "commit=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
 
   build:
     needs: resolve
-    permissions:
-      contents: write
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -121,17 +143,47 @@ jobs:
           shasum -a 256 "$tarball" > "$tarball.sha256" || sha256sum "$tarball" > "$tarball.sha256"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+      - name: Stage platform archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          tag_name: ${{ needs.resolve.outputs.tag }}
-          files: |
+          name: ma-demo-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
             ${{ steps.pkg.outputs.tarball }}
             ${{ steps.pkg.outputs.tarball }}.sha256
 
-  installer:
-    name: attach install.sh
+  verify:
+    name: verify complete release
     needs: [resolve, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - name: Collect platform archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ma-demo-*
+          merge-multiple: true
+          path: release-assets
+      - name: Validate release assets
+        env:
+          RELEASE_VERSION: ${{ needs.resolve.outputs.stripped }}
+        run: |
+          cp install.sh release-assets/install.sh
+          python3 scripts/verify_release.py release-assets "$RELEASE_VERSION"
+      - name: Stage verified release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verified-release
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: publish verified release
+    if: github.event_name != 'pull_request'
+    needs: [resolve, verify]
     permissions:
       contents: write
     runs-on: ubuntu-22.04
@@ -140,45 +192,22 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.commit }}
           persist-credentials: false
-      - name: Upload install.sh
-        uses: softprops/action-gh-release@v2
+      - name: Download verified release
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          tag_name: ${{ needs.resolve.outputs.tag }}
-          files: install.sh
-
-  # Fail loudly if any expected asset is missing — a matrix leg that errored
-  # would otherwise publish a release with a hole (a platform with no tarball).
-  verify:
-    name: verify release assets
-    needs: [resolve, build, installer]
-    if: ${{ !cancelled() && needs.resolve.result == 'success' }}
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Assert all assets attached
+          name: verified-release
+          path: release-assets
+      - name: Upload draft, then publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.stripped }}
         shell: bash
         run: |
-          v="${{ needs.resolve.outputs.stripped }}"
-          tag="${{ needs.resolve.outputs.tag }}"
-          mapfile -t assets < <(gh release view "$tag" --json assets --jq '.assets[].name')
-          printf 'found asset: %s\n' "${assets[@]}"
-          want=(
-            "install.sh"
-            "ma-demo-${v}-x86_64-unknown-linux-gnu.tar.gz"
-            "ma-demo-${v}-aarch64-unknown-linux-gnu.tar.gz"
-            "ma-demo-${v}-x86_64-apple-darwin.tar.gz"
-            "ma-demo-${v}-aarch64-apple-darwin.tar.gz"
-          )
-          missing=0
-          for a in "${want[@]}"; do
-            printf '%s\n' "${assets[@]}" | grep -qxF "$a" || { echo "::error::missing asset: $a"; missing=1; }
-            # Every tarball must have its .sha256 sidecar.
-            case "$a" in
-              *.tar.gz)
-                printf '%s\n' "${assets[@]}" | grep -qxF "$a.sha256" || { echo "::error::missing checksum: $a.sha256"; missing=1; } ;;
-            esac
-          done
-          [ "$missing" -eq 0 ] || exit 1
-          echo "All release assets present."
+          # Creation fails if this tag already has a release: never overwrite
+          # published assets. An interrupted upload remains an unpublished draft.
+          gh release create "$RELEASE_TAG" --verify-tag --draft \
+            --title "$RELEASE_TAG" --notes-file "docs/releases/${RELEASE_VERSION}.md" \
+            release-assets/*
+          gh release edit "$RELEASE_TAG" --draft=false --latest

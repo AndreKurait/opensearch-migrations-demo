@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 /// build time (set from the git tag), or a dev default for a plain `cargo build`.
 pub const VERSION: &str = match option_env!("DEMO_VERSION") {
     Some(v) => v,
-    None => "0.1.0-dev",
+    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
 
 /// How the wizard collects answers. The real binary uses the Ratatui TUI; tests
