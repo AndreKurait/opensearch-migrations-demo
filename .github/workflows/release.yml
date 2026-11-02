@@ -80,14 +80,13 @@ jobs:
             os: ubuntu-22.04
             linker: gcc-aarch64-linux-gnu
             cross: true
-          # Cross-compiled on Apple Silicon (macos-14): the macOS SDK is
-          # universal, so x86_64 needs no extra linker — and this avoids the
-          # chronically-backlogged macos-13 (Intel) runner queue.
+          # Cross-compile Intel binaries on the supported Apple Silicon image;
+          # the macOS SDK includes both architectures.
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
             cross: true
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
